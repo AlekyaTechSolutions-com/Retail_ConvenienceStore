@@ -7,9 +7,12 @@ import 'package:pinaka_pos/Repositories/Orders/order_repository.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:isar/isar.dart'; // Build #1.0.104
 import '../Constants/text.dart';
+import '../Helper/Extentions/money_rounding_helper.dart';
+import '../Helper/customerdisplayhelper.dart';
 import '../Models/Category/category_product_model.dart';
 import '../Models/Orders/get_orders_model.dart' as model;
 import '../Screens/Home/isar_payments/local_payments_db_helper.dart';
+import '../services/CustomerDisplayService.dart';
 import '../services/customer_services.dart';
 import 'db_helper.dart';
 import 'isar_service.dart'; // Build #1.0.104
@@ -158,30 +161,113 @@ class OrderHelper {
 
       for (final entry in cachedEntries) {
         final List products = json.decode(entry.json);
+
         final product = products.firstWhere(
-          (p) => p["fast_key_product_id"] == productId || p["id"] == productId,
+          (p) {
+            final pid = int.tryParse(
+                    (p["fast_key_product_id"] ?? p["id"] ?? "").toString()) ??
+                -1;
+            return pid == productId;
+          },
           orElse: () => null,
         );
 
         if (product == null) continue;
-        if (product["tax_status"] == "none") return 0.0;
 
-        final taxRates = product["tax"]?["tax_rates"];
+        final taxStatus =
+            (product["tax_status"] ?? "taxable").toString().toLowerCase();
+
+        if (taxStatus == "none") return 0.0;
+
+        // Support both cached shapes:
+        // 1) product["tax_rates"] (flat)
+        // 2) product["tax"]["tax_rates"] (nested)
+        final taxRates = product["tax_rates"] ?? product["tax"]?["tax_rates"];
+
         if (taxRates is List && taxRates.isNotEmpty) {
           double taxTotal = 0.0;
+
           for (final tax in taxRates) {
             final double rate =
                 double.tryParse(tax["rate"]?.toString() ?? "0") ?? 0.0;
+
             final double rawTax = (taxableBase * rate) / 100;
-            final double roundedTax = (rawTax * 100).roundToDouble() / 100;
+            final double roundedTax = roundTaxHalfUp(rawTax);
+
             taxTotal += roundedTax;
+
+            print("🧾 TAX LINE → rate:$rate base:$taxableBase tax:$roundedTax");
           }
-          return (taxTotal * 100).roundToDouble() / 100;
+
+          print("✅ TOTAL TAX → $taxTotal");
+          return roundTaxHalfUp(taxTotal);
+        }
+
+        // Fallback: some cached products store a single tax rate instead of tax_rates array.
+        final fallbackRate = double.tryParse(
+              (product["tax_rate"] ?? product["tax"]?["rate"] ?? "0")
+                  .toString(),
+            ) ??
+            0.0;
+        if (fallbackRate > 0) {
+          final tax = roundTaxHalfUp((taxableBase * fallbackRate) / 100);
+          print(
+              "🧾 TAX FALLBACK → rate:$fallbackRate base:$taxableBase tax:$tax");
+          return tax;
+        }
+      }
+
+      // Fallback: check all_products_list cache when product is not in current products_* buckets.
+      final allProductsEntry = isar.isarCacheEntrys
+          .where()
+          .keyEqualTo("productCache::all_products_list")
+          .findFirstSync();
+      if (allProductsEntry != null) {
+        final dynamic decoded = json.decode(allProductsEntry.json);
+        final List allProducts = decoded is List ? decoded : <dynamic>[];
+        final product = allProducts.cast<dynamic>().firstWhere(
+          (p) {
+            final pid = int.tryParse(
+                    (p["fast_key_product_id"] ?? p["id"] ?? "").toString()) ??
+                -1;
+            return pid == productId;
+          },
+          orElse: () => null,
+        );
+
+        if (product != null) {
+          final taxStatus =
+              (product["tax_status"] ?? "taxable").toString().toLowerCase();
+          if (taxStatus == "none") return 0.0;
+
+          final taxRates = product["tax_rates"] ?? product["tax"]?["tax_rates"];
+          if (taxRates is List && taxRates.isNotEmpty) {
+            double taxTotal = 0.0;
+            for (final tax in taxRates) {
+              final double rate =
+                  double.tryParse(tax["rate"]?.toString() ?? "0") ?? 0.0;
+              final double rawTax = (taxableBase * rate) / 100;
+              final double roundedTax = roundTaxHalfUp(rawTax);
+              taxTotal += roundedTax;
+            }
+            return roundTaxHalfUp(taxTotal);
+          }
+
+          final fallbackRate = double.tryParse(
+                (product["tax_rate"] ?? product["tax"]?["rate"] ?? "0")
+                    .toString(),
+              ) ??
+              0.0;
+          if (fallbackRate > 0) {
+            final tax = roundTaxHalfUp((taxableBase * fallbackRate) / 100);
+            return tax;
+          }
         }
       }
     } catch (e) {
-      if (kDebugMode)
+      if (kDebugMode) {
         print("❌ Error calculating tax for product $productId: $e");
+      }
     }
     return 0.0;
   }
@@ -205,11 +291,17 @@ class OrderHelper {
       grossTotal += price * qty;
 
       // Build #1.0.280: If tax_rate is present on the product map (custom items), use it directly.
-      final taxRate = double.tryParse(p['tax_rate']?.toString() ?? '0') ?? 0.0;
-      if (taxRate > 0) {
-        final double rawItemTax = (price * taxRate) / 100;
-        final double roundedItemTax = (rawItemTax * 100).roundToDouble() / 100;
-        orderTax += roundedItemTax * qty;
+      final pid = int.tryParse((p['product_id'] ?? p['id']).toString()) ?? 0;
+
+      final lineTaxStatus =
+          (p['tax_status'] ?? 'taxable').toString().toLowerCase();
+      final lineTaxRate =
+          double.tryParse((p['tax_rate'] ?? '0').toString()) ?? 0.0;
+
+      if (lineTaxStatus == 'taxable' && lineTaxRate > 0) {
+        orderTax += roundTaxHalfUp(((price * qty) * lineTaxRate) / 100);
+      } else if (pid > 0) {
+        orderTax += getProductTaxFromHive(pid, price, qty);
       } else {
         final pid = int.tryParse((p['product_id'] ?? p['id']).toString()) ?? 0;
         if (pid > 0) {
@@ -226,9 +318,11 @@ class OrderHelper {
 
       final taxRate = double.tryParse(c['tax_rate']?.toString() ?? '0') ?? 0.0;
       if (taxRate > 0) {
-        orderTax += ((price * taxRate) / 100) * qty;
+        orderTax += roundTaxHalfUp(((price * taxRate) / 100) * qty);
       }
     }
+
+    orderTax = roundTaxHalfUp(orderTax);
 
     // 3. Payouts & cashbacks
     double payoutTotal = payouts.fold(0.0,
@@ -357,11 +451,31 @@ class OrderHelper {
 
   Future<void> loadData() async {
     final prefs = await SharedPreferences.getInstance();
-    activeOrderId = prefs.getInt('activeOrderId');
+    // Use local variables to avoid race conditions with other async tasks
+    int? currentActiveOrderId = prefs.getInt('activeOrderId');
+
+    // Build #1.0.287: Try to recover from lastActiveOrderId if activeOrderId is missing (fixes navigation focus jump)
+    if (currentActiveOrderId == null ||
+        currentActiveOrderId == 0 ||
+        currentActiveOrderId == -1) {
+      currentActiveOrderId = prefs.getInt('lastActiveOrderId');
+    }
+
     activeUserId = await getUserIdFromDB();
 
-    orderIds = [];
-    orders = [];
+    // Build #1.0.312: Defensive check for user ID during transitions
+    if (activeUserId == 0) {
+      if (kDebugMode)
+        print("⚠ activeUserId is 0 in loadData, attempting one retry...");
+      // Small pause and retry once
+      await Future.delayed(const Duration(milliseconds: 100));
+      activeUserId = await getUserIdFromDB();
+      if (activeUserId == 0 && kDebugMode)
+        print("⚠ activeUserId still 0 after retry");
+    }
+
+    List<int> localOrderIds = [];
+    List<Map<String, dynamic>> localOrders = [];
 
     // Always offline
     if (kDebugMode) print("📴 Loading offline orders");
@@ -404,6 +518,17 @@ class OrderHelper {
       // ✅ Normalize the root map
       final normalized = Map<String, dynamic>.from(entry.value as Map);
 
+      // Build #1.0.287: Ensure order_id is present in the map content (fallback to Hive Key)
+      // This prevents focus jumps if some code saved the order map without an internal ID.
+      if (!normalized.containsKey('order_id') &&
+          !normalized.containsKey('id') &&
+          !normalized.containsKey(AppDBConst.orderServerId)) {
+        final keyId = int.tryParse(entry.key.toString());
+        if (keyId != null) {
+          normalized['order_id'] = keyId;
+        }
+      }
+
       // ✅ Normalize nested 'products' list if present
       if (normalized['products'] is List) {
         final rawProducts = normalized['products'] as List;
@@ -438,11 +563,11 @@ class OrderHelper {
 
     if (validEntries.isNotEmpty) {
       // ⚡ Ensure mutable list (not fixed-length)
-      orders =
+      localOrders =
           List<Map<String, dynamic>>.from(validEntries.map((e) => e.value));
 
       // ✅ Sort by created_at ascending (oldest first) so that new orders stay on the right
-      orders.sort((a, b) {
+      localOrders.sort((a, b) {
         final aTime = a['created_at']?.toString() ?? '';
         final bTime = b['created_at']?.toString() ?? '';
         final cmp = aTime.compareTo(bTime);
@@ -453,7 +578,7 @@ class OrderHelper {
       });
 
       // ✅ Extract order IDs from sorted orders (keeps orderIds in sync)
-      orderIds = orders
+      localOrderIds = localOrders
           .map((map) {
             if (map.containsKey('order_id')) return map['order_id'] as int?;
             if (map.containsKey('id')) return map['id'] as int?;
@@ -464,39 +589,55 @@ class OrderHelper {
           .toList();
 
       // Build #1.0.285: Validate if restored activeOrderId belongs to current user
-      if (activeOrderId != null) {
+      if (currentActiveOrderId != null) {
         final box = StorageProvider.offlineOrders;
-        final raw = await box.get(activeOrderId.toString());
+        final raw = await box.get(currentActiveOrderId.toString());
         if (raw != null && raw is Map) {
           final dynamic orderUserId = raw['user_id'] ?? raw[AppDBConst.userId];
-          if (orderUserId?.toString() != activeUserId.toString()) {
+          if (orderUserId?.toString() != activeUserId.toString() &&
+              activeUserId != 0) {
             if (kDebugMode)
               print(
-                  "🚫 Restored Order $activeOrderId filtered: Wrong User $orderUserId");
-            activeOrderId = null;
+                  "🚫 Restored Order $currentActiveOrderId filtered: Wrong User $orderUserId (activeUser: $activeUserId)");
+            currentActiveOrderId = null;
           }
         } else {
           // check DB if not in hive
-          final dbOrders = await getOrderById(activeOrderId!);
+          final dbOrders = await getOrderById(currentActiveOrderId);
           if (dbOrders.isEmpty) {
-            activeOrderId = null;
+            currentActiveOrderId = null;
           }
         }
       }
 
       // ✅ Set active order ID if not found or invalid
-      if (activeOrderId == null || !orderIds.contains(activeOrderId)) {
-        activeOrderId = orderIds.isNotEmpty ? orderIds.last : null;
-        if (activeOrderId != null) {
-          await prefs.setInt('activeOrderId', activeOrderId!);
+      if (currentActiveOrderId == null ||
+          !localOrderIds.contains(currentActiveOrderId)) {
+        // Build #1.0.315: Last attempt restore from checkpoint before jumping to newest
+        currentActiveOrderId = prefs.getInt('lastActiveOrderId');
+        if (currentActiveOrderId != null &&
+            !localOrderIds.contains(currentActiveOrderId)) {
+          currentActiveOrderId = null;
+        }
+
+        currentActiveOrderId ??=
+            localOrderIds.isNotEmpty ? localOrderIds.last : null;
+
+        if (currentActiveOrderId != null) {
+          await prefs.setInt('activeOrderId', currentActiveOrderId);
         }
       }
     } else {
       if (kDebugMode) print("⚠ No valid offline order maps found in Hive");
-      activeOrderId = null;
-      orderIds = [];
-      orders = [];
+      currentActiveOrderId = null;
+      localOrderIds = [];
+      localOrders = [];
     }
+
+    // Final assignment to class properties
+    orderIds = localOrderIds;
+    orders = localOrders;
+    activeOrderId = currentActiveOrderId;
 
     if (kDebugMode) {
       print("#### Offline Orders Loaded ####");
@@ -506,6 +647,34 @@ class OrderHelper {
     }
   }
 
+  /// Same id resolution as order panel tabs (`widget_order_panel` _getOrderTabs).
+  int? _normalizeOrderIdForShiftCheck(Map<String, dynamic> order) {
+    final dynamic raw =
+        order[AppDBConst.orderServerId] ?? order['order_id'] ?? order['id'];
+    if (raw == null) return null;
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    return int.tryParse(raw.toString());
+  }
+
+  bool _hasShiftBlockingItems(Map<String, dynamic> order) {
+    final List products = order['products'] as List? ?? [];
+    final List customItems = order['custom_items'] as List? ?? [];
+    final List payouts = order['payouts'] as List? ?? [];
+    final List cashbacks = order['cashbacks'] as List? ?? [];
+
+    if ([products, customItems, payouts, cashbacks].any((l) => l.isNotEmpty)) {
+      return true;
+    }
+
+    final request = order['request'];
+    if (request is Map) {
+      final lineItems = request['line_items'];
+      if (lineItems is List && lineItems.isNotEmpty) return true;
+    }
+    return false;
+  }
+
   // Build #1.0.281: Check if there are any active orders that should block closing shift
   Future<bool> hasActiveOrders() async {
     await loadData(); // Load offline orders
@@ -513,6 +682,52 @@ class OrderHelper {
     if (orders.isEmpty) {
       if (kDebugMode) print("#### No orders found for user $activeUserId");
       return false;
+    }
+
+    // If a draft active order session exists (current activeOrderId) with no cart items,
+    // block close shift so user can explicitly clear/close that cart first.
+    if (activeOrderId != null && activeOrderId! > 0) {
+      Map<String, dynamic>? activeOrder;
+      for (final o in orders) {
+        final id = _normalizeOrderIdForShiftCheck(o);
+        if (id == activeOrderId) {
+          activeOrder = o;
+          break;
+        }
+      }
+      if (activeOrder != null && !_hasShiftBlockingItems(activeOrder)) {
+        if (kDebugMode) {
+          print(
+            "#### BLOCKED - Active order $activeOrderId exists with empty cart; close shift not allowed",
+          );
+        }
+        return true;
+      }
+    }
+
+    // Build #1.0.286: Block shift while any order would still appear on the order panel.
+    // Tabs hide only after LocalPaymentDB has at least one payment for that order id.
+    for (final order in orders) {
+      final int? panelOrderId = _normalizeOrderIdForShiftCheck(order);
+      if (panelOrderId == null || panelOrderId == 0) continue;
+      if (!_hasShiftBlockingItems(order)) {
+        if (kDebugMode) {
+          print(
+            "#### SKIP - Order $panelOrderId has no cart items, ignoring for shift close",
+          );
+        }
+        continue;
+      }
+      final panelPayments = await LocalPaymentDBHelper.instance
+          .getPaymentsByOrderId(panelOrderId, userId: activeUserId);
+      if (panelPayments.isEmpty) {
+        if (kDebugMode) {
+          print(
+            "#### BLOCKED - Order $panelOrderId still on order panel (no payments); shift close not allowed",
+          );
+        }
+        return true;
+      }
     }
 
     for (var order in orders) {
@@ -548,6 +763,8 @@ class OrderHelper {
           .getPaymentStatusSummary(orderId, userId: activeUserId);
 
       final bool fullyPaid = summary['fullyPaid'] as bool? ?? false;
+      final bool hasPayments = (summary['hasPayments'] as bool? ?? false) ||
+          ((summary['paymentCount'] as num?)?.toInt() ?? 0) > 0;
       final double remaining = (summary['remainingBalance'] ?? 0).toDouble();
       final double total = (summary['orderTotal'] ?? 0).toDouble();
 
@@ -556,8 +773,16 @@ class OrderHelper {
             "#### Order $orderId → fullyPaid: $fullyPaid, remaining: $remaining, total: $total");
       }
 
-      // Block if completely unpaid
-      if (!fullyPaid && remaining == total) {
+      // If any payment exists and no remaining balance, allow close shift.
+      // Some rows can carry total=0 while still having completed payments.
+      if (hasPayments && remaining <= 0) {
+        print(
+            "#### Order $orderId has payments and zero balance → allowed to close shift");
+        continue;
+      }
+
+      // Block only when genuinely unpaid (no payments recorded).
+      if (!hasPayments && !fullyPaid && remaining == total) {
         print("#### BLOCKED - Order $orderId has items but no payment at all");
         return true;
       }
@@ -1809,9 +2034,32 @@ class OrderHelper {
       await prefs.remove('activeOrderId');
     }
 
-    // Reload the updated order list
+    // Prevent restoreActiveOrderId() from reviving a deleted or last-deleted cart
+    if (prefs.getInt('lastActiveOrderId') == orderId || orderIds.isEmpty) {
+      await prefs.remove('lastActiveOrderId');
+    }
+    if (orderIds.isEmpty) {
+      activeOrderId = null;
+      await prefs.remove('activeOrderId');
+    }
+
     await loadData();
 
+// ✅ Capture final state AFTER loadData
+    final int? finalActiveId = activeOrderId;
+
+    print("🎯 Final activeOrderId after loadData: $finalActiveId");
+
+// 🔥 SYNC CUSTOMER DISPLAY AFTER DELETE
+    if (finalActiveId != null) {
+      print("🔄 Active order exists → updating display: $finalActiveId");
+
+      await CustomerDisplayHelper.updateCustomerDisplay(finalActiveId);
+    } else {
+      print("🧹 No active order → resetting display");
+
+      await CustomerDisplayService.resetDisplay();
+    }
     // Debugging logs
     if (kDebugMode) {
       print('#### Order deleted with ID: $orderId');
@@ -1850,16 +2098,52 @@ class OrderHelper {
     }
   }
 
+  /// True if this order still exists in offline (Hive) for the current user, or in SQLite.
+  Future<bool> localOrderExistsForActiveUser(int orderId) async {
+    final offlineBox = StorageProvider.offlineOrders;
+    final dynamic raw = await offlineBox.get(orderId.toString());
+    if (raw != null && raw is Map) {
+      final order = Map<String, dynamic>.from(raw);
+      final currentUserId = await getUserIdFromDB();
+      final dynamic orderUserId = order['user_id'] ?? order[AppDBConst.userId];
+      if (orderUserId?.toString() == currentUserId.toString()) {
+        return true;
+      }
+    }
+    final rows = await getOrderById(orderId);
+    return rows.isNotEmpty;
+  }
+
+  /// Clears in-memory and persisted cart selection (fixes ghost cart after delete/restart).
+  Future<void> clearPersistedCartSelection() async {
+    activeOrderId = null;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('activeOrderId');
+    await prefs.remove('lastActiveOrderId');
+    if (kDebugMode) {
+      print("##### Cleared persisted cart selection (active + lastActive)");
+    }
+  }
+
   // Build #1.0.161: Restore active order when returning
   Future<void> restoreActiveOrderId() async {
     final prefs = await SharedPreferences.getInstance();
     final lastOrderId = prefs.getInt('lastActiveOrderId');
 
-    if (lastOrderId != null && lastOrderId != -1) {
-      await setActiveOrder(lastOrderId);
+    if (lastOrderId == null || lastOrderId == -1) return;
+
+    if (!await localOrderExistsForActiveUser(lastOrderId)) {
+      await clearPersistedCartSelection();
       if (kDebugMode) {
-        print("##### Restored active order ID: $lastOrderId");
+        print(
+            "##### Skipped restore: lastActiveOrderId $lastOrderId has no local order — cleared prefs");
       }
+      return;
+    }
+
+    await setActiveOrder(lastOrderId);
+    if (kDebugMode) {
+      print("##### Restored active order ID: $lastOrderId");
     }
   }
 
@@ -1911,6 +2195,33 @@ class OrderHelper {
     return double.tryParse(value.toString()) ?? 0.0;
   }
 
+  /// Hive/SQLite may store EBT as bool, 0/1, or string — not only `== true`.
+  static bool offlineLineItemEbtEligible(dynamic v) {
+    if (v == true || v == 1) return true;
+    if (v is String) {
+      final s = v.toLowerCase().trim();
+      return s == '1' || s == 'true' || s == 'yes';
+    }
+    return false;
+  }
+
+  static int offlineLineItemVariationId(Map<String, dynamic> map) {
+    final raw = map['variation_id'] ??
+        map['variationId'] ??
+        map['item_variation'] ??
+        map['item_variation_id'] ??
+        0;
+    final v = raw is num ? raw.toInt() : int.tryParse(raw.toString()) ?? 0;
+    return v < 0 ? 0 : v;
+  }
+
+  static String offlineLineItemVariationName(Map<String, dynamic> map) {
+    final n = map['variation_name'] ??
+        map['item_variation_custom_name'] ??
+        map['attribute_variant'];
+    return n?.toString().trim() ?? '';
+  }
+
   /// Resolves product image URL from various possible keys. Delegates to top-level [resolveProductImageFromMap].
   static String resolveProductImage(dynamic map) =>
       resolveProductImageFromMap(map);
@@ -1960,6 +2271,9 @@ class OrderHelper {
             0);
         final combo = _toDouble(
             map['combo_discount_total'] ?? map['comboDiscountTotal'] ?? 0);
+        final vid = offlineLineItemVariationId(map);
+        final vName = offlineLineItemVariationName(map);
+        final itemTypeLower = itemType.toLowerCase();
         items.add({
           AppDBConst.itemName: name,
           AppDBConst.itemPrice: price,
@@ -1967,12 +2281,16 @@ class OrderHelper {
           AppDBConst.itemSumPrice: price * qty,
           AppDBConst.itemImage: resolveProductImageFromMap(map),
           AppDBConst.itemType: itemType,
-          'is_ebt_eligible': map['is_ebt_eligible'] == true,
+          'is_ebt_eligible': offlineLineItemEbtEligible(map['is_ebt_eligible']),
           'product_id': (map['product_id'] as num?)?.toInt() ?? 0,
-          'variation_id': int.tryParse(
-                  (map['variation_id'] ?? map['variationId'] ?? 0)
-                      .toString()) ??
-              0,
+          'variation_id': vid,
+          'variationId': vid,
+          'item_variation': vid,
+          'item_variation_id': vid,
+          'variation_name': vName,
+          'is_variant': vid > 0 ||
+              itemTypeLower == 'variant' ||
+              itemTypeLower == 'variation',
           'sku': map['sku'] ?? map['item_sku'] ?? '',
           AppDBConst.multipackDiscount: multipack,
           AppDBConst.autoDiscountTotal: auto,
@@ -2001,6 +2319,8 @@ class OrderHelper {
         final combo = _toDouble(
             map['combo_discount_total'] ?? map['comboDiscountTotal'] ?? 0);
 
+        final vid = offlineLineItemVariationId(map);
+        final vName = offlineLineItemVariationName(map);
         items.add({
           AppDBConst.itemName: name,
           AppDBConst.itemPrice: price,
@@ -2008,12 +2328,15 @@ class OrderHelper {
           AppDBConst.itemSumPrice: sumPrice,
           AppDBConst.itemImage: resolveProductImageFromMap(map),
           AppDBConst.itemType: map['item_type'] ?? map['type'] ?? 'product',
-          'is_ebt_eligible': map['is_ebt_eligible'] == true,
+          'is_ebt_eligible': offlineLineItemEbtEligible(map['is_ebt_eligible']),
           'product_id': (map['product_id'] as num?)?.toInt() ?? 0,
-          'variation_id': int.tryParse(
-                  (map['variation_id'] ?? map['variationId'] ?? 0)
-                      .toString()) ??
-              0,
+          'variation_id': vid,
+          'variationId': vid,
+          'item_variation': vid,
+          'item_variation_id': vid,
+          'variation_name': vName,
+          'is_variant':
+              vid > 0 || itemType == 'variant' || itemType == 'variation',
           'sku': map['sku'] ?? '',
           AppDBConst.multipackDiscount: multipack,
           AppDBConst.autoDiscountTotal: auto,
@@ -2116,6 +2439,92 @@ class OrderHelper {
   //// code added here **88
   static final Set<String> _activeAdds = {};
 
+  double _combinedTaxRate(dynamic taxRates, dynamic fallbackRate) {
+    if (taxRates is List && taxRates.isNotEmpty) {
+      double total = 0.0;
+      for (final t in taxRates) {
+        total += double.tryParse((t["rate"] ?? "0").toString()) ?? 0.0;
+      }
+      if (total > 0) return total;
+    }
+    return double.tryParse((fallbackRate ?? "0").toString()) ?? 0.0;
+  }
+
+  Future<Map<String, dynamic>> _resolveProductTaxMeta(int productId) async {
+    String status = "taxable";
+    String taxClass = "";
+    double rate = 0.0;
+
+    try {
+      final isar = IsarService.sync;
+      if (isar != null) {
+        final cachedEntries = isar.isarCacheEntrys
+            .where()
+            .filter()
+            .keyStartsWith("products_")
+            .findAllSync();
+
+        for (final entry in cachedEntries) {
+          final List products = json.decode(entry.json);
+          final product = products.firstWhere(
+            (p) {
+              final pid = int.tryParse(
+                      (p["fast_key_product_id"] ?? p["id"] ?? "").toString()) ??
+                  -1;
+              return pid == productId;
+            },
+            orElse: () => null,
+          );
+
+          if (product == null) continue;
+          status = (product["tax_status"] ?? "taxable").toString();
+          taxClass = (product["tax_class"] ?? "").toString();
+          final taxRates = product["tax_rates"] ?? product["tax"]?["tax_rates"];
+          rate = _combinedTaxRate(
+            taxRates,
+            product["tax_rate"] ?? product["tax"]?["rate"],
+          );
+          return {
+            "tax_status": status,
+            "tax_class": taxClass,
+            "tax_rate": rate,
+          };
+        }
+      }
+
+      // Fallback to flattened product list cache.
+      final allProducts =
+          await StorageProvider.productCache.get("all_products_list");
+      if (allProducts is List) {
+        final product = allProducts.cast<dynamic>().firstWhere(
+          (p) {
+            final pid = int.tryParse(
+                    (p["fast_key_product_id"] ?? p["id"] ?? "").toString()) ??
+                -1;
+            return pid == productId;
+          },
+          orElse: () => null,
+        );
+
+        if (product != null) {
+          status = (product["tax_status"] ?? "taxable").toString();
+          taxClass = (product["tax_class"] ?? "").toString();
+          final taxRates = product["tax_rates"] ?? product["tax"]?["tax_rates"];
+          rate = _combinedTaxRate(
+            taxRates,
+            product["tax_rate"] ?? product["tax"]?["rate"],
+          );
+        }
+      }
+    } catch (_) {}
+
+    return {
+      "tax_status": status,
+      "tax_class": taxClass,
+      "tax_rate": rate,
+    };
+  }
+
   Future<void> addItemToOrder(
     int? serverItemId,
     String name,
@@ -2126,6 +2535,7 @@ class OrderHelper {
     int orderId, {
     VoidCallback? onItemAdded,
     String? type,
+    double? weightQty,
     int? productId = -1,
     int? variationId = -1,
     String? variationName,
@@ -2181,6 +2591,34 @@ class OrderHelper {
       final rawNormVar = (variationId ?? 0).toInt();
       final normVariationId = rawNormVar <= 0 ? 0 : rawNormVar;
 
+      const double defaultNonEbtTaxRate = 9.1;
+      String effectiveTaxStatus = (taxStatus ?? '').trim();
+      String? effectiveTaxClass = taxClass;
+      double effectiveTaxRate = taxRate ?? 0.0;
+      if (normProductId > 0 &&
+          (effectiveTaxStatus.isEmpty || effectiveTaxRate <= 0)) {
+        final meta = await _resolveProductTaxMeta(normProductId);
+        effectiveTaxStatus =
+            (meta["tax_status"]?.toString().trim().isNotEmpty == true)
+                ? meta["tax_status"].toString()
+                : (effectiveTaxStatus.isEmpty ? "taxable" : effectiveTaxStatus);
+        effectiveTaxClass = (meta["tax_class"]?.toString().isNotEmpty == true)
+            ? meta["tax_class"].toString()
+            : effectiveTaxClass;
+        effectiveTaxRate =
+            (meta["tax_rate"] as num?)?.toDouble() ?? effectiveTaxRate;
+      }
+      // Business rule: all non-EBT items are taxable; EBT items are tax-free.
+      if (isEbtEligible) {
+        effectiveTaxStatus = "none";
+        effectiveTaxRate = 0.0;
+      } else {
+        effectiveTaxStatus = "taxable";
+        if (effectiveTaxRate <= 0) {
+          effectiveTaxRate = defaultNonEbtTaxRate;
+        }
+      }
+
       // Find existing item to merge quantity (scan/search/selection)
       final existingIndex = products.indexWhere((p) {
         // Normalize stored ids to int because some flows store them as String/num
@@ -2217,12 +2655,20 @@ class OrderHelper {
         // For normal products, also allow merge when SKU matches and there is
         // effectively no variation on either side. This handles flows where one
         // caller passes a different internal product id for the same barcode.
+        // Only when at least one side has no reliable product id — otherwise
+        // many items share placeholders like "N/A" and would incorrectly merge.
         if (!matchesIds) {
-          final storedSku = normalizeSku(p['sku']?.toString() ?? '');
-          final newSku = normalizeSku(sku);
-          final bothNoVariation = vid == 0 && normVariationId == 0;
-          if (bothNoVariation && storedSku.isNotEmpty && storedSku == newSku) {
-            return true;
+          final ambiguousIncoming = normProductId <= 0;
+          final ambiguousStored = pid <= 0;
+          if (ambiguousIncoming || ambiguousStored) {
+            final storedSku = normalizeSku(p['sku']?.toString() ?? '');
+            final newSku = normalizeSku(sku);
+            final bothNoVariation = vid == 0 && normVariationId == 0;
+            if (bothNoVariation &&
+                storedSku.isNotEmpty &&
+                storedSku == newSku) {
+              return true;
+            }
           }
         }
         return matchesIds;
@@ -2230,11 +2676,66 @@ class OrderHelper {
 
       if (existingIndex != -1) {
         final existing = products[existingIndex];
+        final incomingType = (type ?? '').toString().toLowerCase();
+        final existingType = (existing['type'] ?? '').toString().toLowerCase();
+        final bool incomingWeighted = incomingType.contains('weighted');
+        final bool existingWeighted = existingType.contains('weighted');
+
         final oldQty = (existing['quantity'] ?? 0).toInt();
-        final newQty = oldQty + quantity;
+        final int newQty;
+        final double unitPrice = (existing['unit_price'] as num?)?.toDouble() ??
+            (existing['regular_price'] as num?)?.toDouble() ??
+            (existing['sales_price'] as num?)?.toDouble() ??
+            (existing['price'] as num?)?.toDouble() ??
+            0.0;
+
+        // For weighted items, we merge by accumulating weight + total price,
+        // while keeping quantity fixed at 1 (so totals remain correct).
+        double mergedLinePrice;
+        double mergedWeightQty = 0.0;
+        if (incomingWeighted || existingWeighted) {
+          newQty = 1;
+
+          final double oldLinePrice =
+              (existing['price'] as num?)?.toDouble() ?? 0.0;
+          mergedLinePrice = oldLinePrice + price;
+
+          final double oldWeight =
+              (existing['weight_qty'] as num?)?.toDouble() ??
+                  ((unitPrice > 0) ? (oldLinePrice / unitPrice) : 0.0);
+          final double addWeight =
+              weightQty ?? ((unitPrice > 0) ? (price / unitPrice) : 0.0);
+          mergedWeightQty = oldWeight + addWeight;
+        } else {
+          newQty = oldQty + quantity;
+          mergedLinePrice = (existing['price'] ?? 0).toDouble();
+        }
 
         final mergedEbt =
             (existing['is_ebt_eligible'] == true) || (isEbtEligible == true);
+        double itemTaxRate = double.tryParse(
+                (existing['tax_rate'] ?? effectiveTaxRate).toString()) ??
+            0.0;
+        String itemTaxStatus = (existing['tax_status'] ?? effectiveTaxStatus)
+            .toString()
+            .toLowerCase();
+        if (mergedEbt) {
+          itemTaxStatus = "none";
+          itemTaxRate = 0.0;
+        } else {
+          itemTaxStatus = "taxable";
+          if (itemTaxRate <= 0) itemTaxRate = defaultNonEbtTaxRate;
+        }
+
+        double itemTax = 0.0;
+
+        if (itemTaxStatus == "taxable" && itemTaxRate > 0) {
+          final double taxableBase = (incomingWeighted || existingWeighted)
+              ? mergedLinePrice
+              : (mergedLinePrice * newQty);
+          itemTax = roundTaxHalfUp(taxableBase * (itemTaxRate / 100));
+          print("🔁 UPDATED TAX → rate:$itemTaxRate qty:$newQty tax:$itemTax");
+        }
 
         print("🔁 EXISTING ITEM FOUND → $name");
         print("   Old Qty: $oldQty → New Qty: $newQty");
@@ -2244,7 +2745,15 @@ class OrderHelper {
           ...existing,
           'quantity': newQty,
           'is_ebt_eligible': mergedEbt,
-          'price': existing['price'],
+          'price': mergedLinePrice,
+          'tax_status': itemTaxStatus,
+          'tax_class': existing['tax_class'] ?? effectiveTaxClass,
+          'tax_rate': itemTaxRate,
+
+          // 🔥 UPDATE TAX
+          'item_tax': itemTax,
+          if (incomingWeighted || existingWeighted)
+            'weight_qty': mergedWeightQty,
         };
 
         print("🔁 SAME PRODUCT → Qty incremented.");
@@ -2257,7 +2766,9 @@ class OrderHelper {
           'name': name,
           'image': image,
           'price': price,
-          'quantity': quantity,
+          'quantity': (type ?? '').toString().toLowerCase().contains('weighted')
+              ? 1
+              : quantity,
           'sku': sku,
           'type': (variationId != null && variationId > 0)
               ? 'variant'
@@ -2275,12 +2786,18 @@ class OrderHelper {
           'sales_price': salesPrice,
           'regular_price': regularPrice,
           'unit_price': unitPrice,
+          if ((type ?? '').toString().toLowerCase().contains('weighted'))
+            'weight_qty': weightQty ??
+                ((unitPrice != null && unitPrice > 0)
+                    ? (price / unitPrice)
+                    : 0.0),
 
           /// ⭐ NOW SAVED CORRECTLY
           'is_ebt_eligible': isEbtEligible,
-          'tax_status': taxStatus,
-          'tax_class': taxClass,
-          'tax_rate': taxRate,
+          'tax_status':
+              effectiveTaxStatus.isEmpty ? "taxable" : effectiveTaxStatus,
+          'tax_class': effectiveTaxClass,
+          'tax_rate': effectiveTaxRate,
 
           // Discount fields (0 for new items; preserve when merged from existing)
           'auto_discount': 0.0,
@@ -2301,18 +2818,20 @@ class OrderHelper {
       // Calculate totals and save to Hive + Memory
       await saveOfflineOrder(orderId, updatedOrder);
       // ead back the values that saveOfflineOrder wrote
-      final double subtotal = (updatedOrder['gross_total'] as num?)?.toDouble() ?? 0.0;
-      final double tax      = (updatedOrder['order_tax']   as num?)?.toDouble() ?? 0.0;
-      final double total    = (updatedOrder['net_payable'] as num?)?.toDouble() ?? 0.0;
+      final double subtotal =
+          (updatedOrder['gross_total'] as num?)?.toDouble() ?? 0.0;
+      final double tax = (updatedOrder['order_tax'] as num?)?.toDouble() ?? 0.0;
+      final double total =
+          (updatedOrder['net_payable'] as num?)?.toDouble() ?? 0.0;
 
       // / 🔄 Send update to Customer Display
-    // await CustomerService.publishCartUpdate(
-    // orderId,
-    // products,
-    // subtotal: subtotal,
-    // tax: tax,
-    // total: total,
-    // );
+      // await CustomerService.publishCartUpdate(
+      // orderId,
+      // products,
+      // subtotal: subtotal,
+      // tax: tax,
+      // total: total,
+      // );
 
       notifyOrderPanelToRefresh();
       if (onItemAdded != null) onItemAdded();

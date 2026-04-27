@@ -12,6 +12,7 @@ import 'package:flutter_barcode_listener/flutter_barcode_listener.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:flutter_svg/svg.dart';
 import 'package:focus_detector/focus_detector.dart';
+import 'package:http/http.dart' as http;
 import 'package:pinaka_pos/Database/storage/storage_provider.dart';
 import 'package:intl/intl.dart';
 import 'package:isar/isar.dart';
@@ -19,6 +20,7 @@ import 'package:pinaka_pos/Database/discount_rule_isar.dart';
 import 'package:pinaka_pos/Database/isar_cache_entry.dart';
 import 'package:pinaka_pos/Models/Search/product_by_sku_model.dart' as SKU;
 import 'package:pinaka_pos/Models/Search/product_search_model.dart';
+import 'package:pinaka_pos/Models/Search/product_variation_model.dart';
 import 'package:pinaka_pos/Providers/Auth/product_variation_provider.dart';
 import 'package:pinaka_pos/Screens/Home/order_summary_screen.dart';
 import 'package:pinaka_pos/Widgets/scanner_guard.dart';
@@ -45,9 +47,12 @@ import '../Database/db_helper.dart';
 import '../Database/isar_service.dart';
 import '../Database/order_panel_db_helper.dart';
 import '../Database/user_db_helper.dart';
+import '../Helper/native_usb_scan_bridge.dart';
+import '../Helper/Extentions/money_rounding_helper.dart';
 import '../Helper/Extentions/theme_notifier.dart';
 import '../Helper/api_response.dart';
 import '../Helper/customerdisplayhelper.dart';
+import '../Helper/url_helper.dart';
 import '../Models/Assets/asset_model.dart';
 import '../Preferences/pinaka_preferences.dart';
 import '../Repositories/Category/category_repository.dart';
@@ -101,6 +106,31 @@ class RightOrderPanel extends StatefulWidget {
 
 class _RightOrderPanelState extends State<RightOrderPanel>
     with TickerProviderStateMixin, WidgetsBindingObserver {
+  Future<void> _agentDebugLog({
+    required String hypothesisId,
+    required String location,
+    required String message,
+    required Map<String, dynamic> data,
+    String runId = "run1",
+  }) async {
+    try {
+      final payload = <String, dynamic>{
+        "sessionId": "f67d41",
+        "runId": runId,
+        "hypothesisId": hypothesisId,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": DateTime.now().millisecondsSinceEpoch,
+      };
+      await File("debug-f67d41.log").writeAsString(
+        "${jsonEncode(payload)}\n",
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (_) {}
+  }
+
   List<Map<String, Object>> tabs = []; // List of order tabs
   TabController? _tabController; // Controller for tab switching
   final ScrollController _scrollController =
@@ -130,8 +160,11 @@ class _RightOrderPanelState extends State<RightOrderPanel>
   double cashbackFee = 0.0;
   bool _scanLocked = false;
   bool _ageVerificationActive = false;
-  String _lastScannedBarcode = '';
+  bool _isWeightDialogOpen = false;
+  String? _lastScannedBarcode;
   DateTime? _lastScanTime;
+  int _fetchOrderItemsRequestId = 0;
+
   Map<String, dynamic>? resolvedProductMap;
   VoidCallback? _orderPanelRefreshListener;
   bool _isNewTabDisabled = false;
@@ -161,15 +194,36 @@ class _RightOrderPanelState extends State<RightOrderPanel>
     return double.tryParse(value.toString()) ?? 0.0;
   }
 
+  int? _normalizeOrderId(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value.toString());
+  }
+
+  /// True when [activeId] matches a tab (handles int/String mismatches).
+  bool _tabsContainActiveOrder(int? activeId) {
+    if (activeId == null) return false;
+    for (final t in tabs) {
+      final id = _normalizeOrderId(t['orderId']);
+      if (id != null && id == activeId) return true;
+    }
+    return false;
+  }
+
   String normalizeSku(String sku) {
     return sku.trim().toLowerCase().replaceAll(" ", "");
   }
 
   late final CategoryRepository _categoryRepository;
 
+  void _onNativeUsbBarcode(String barcode) =>
+      unawaited(_handleOrderPanelBarcode(barcode));
+
   @override
   void initState() {
     super.initState();
+    NativeUsbScanBridge.registerHandler(_onNativeUsbBarcode);
     _categoryRepository = CategoryRepository();
     WidgetsBinding.instance.addObserver(this);
     orderBloc = OrderBloc(OrderRepository());
@@ -333,10 +387,14 @@ class _RightOrderPanelState extends State<RightOrderPanel>
     // --------------------------------------------------
     final List<Map<String, dynamic>> visibleOrders = [];
 
-    for (final order in orderHelper.orders) {
-      final int? orderId = order[AppDBConst.orderServerId] as int? ??
-          order['order_id'] as int? ??
-          int.tryParse(order['id']?.toString() ?? '');
+    // Build #1.0.287: Take a snapshot of orders to avoid race conditions during async loop
+    final List<Map<String, dynamic>> ordersSnapshot =
+        List<Map<String, dynamic>>.from(orderHelper.orders);
+
+    for (final order in ordersSnapshot) {
+      final int? orderId = _normalizeOrderId(
+        order[AppDBConst.orderServerId] ?? order['order_id'] ?? order['id'],
+      );
       if (orderId == null) continue;
 
       final payments = await LocalPaymentDBHelper.instance
@@ -362,18 +420,32 @@ class _RightOrderPanelState extends State<RightOrderPanel>
     if (!mounted) return;
 
     setState(() {
-      tabs = visibleOrders.asMap().entries.map((entry) {
-        final o = entry.value;
-        final id = o[AppDBConst.orderServerId] ??
-            o['order_id'] ??
-            o[AppDBConst.orderId] ??
-            o['id'];
-        return {
-          "title": "$id",
-          "subtitle": "Tab ${entry.key + 1}",
-          "orderId": id as Object,
-        };
-      }).toList();
+      tabs = visibleOrders
+          .asMap()
+          .entries
+          .map((entry) {
+            final o = entry.value;
+            final normalizedId = _normalizeOrderId(
+              o[AppDBConst.orderServerId] ??
+                  o['order_id'] ??
+                  o[AppDBConst.orderId] ??
+                  o['id'],
+            );
+            if (normalizedId == null) {
+              return <String, Object>{
+                "title": "",
+                "subtitle": "Tab ${entry.key + 1}",
+                "orderId": 0,
+              };
+            }
+            return {
+              "title": "$normalizedId",
+              "subtitle": "Tab ${entry.key + 1}",
+              "orderId": normalizedId,
+            };
+          })
+          .where((t) => (t["orderId"] as int) > 0)
+          .toList();
 
       if (kDebugMode) {
         print("##### DEBUG: Loaded ${tabs.length} tabs: $tabs");
@@ -400,7 +472,10 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 // --------------------------------------------------
 // 3️⃣ HARD ACTIVE ORDER SAFETY (REQUIRED)
 // --------------------------------------------------
-    final visibleOrderIds = tabs.map((t) => t['orderId'] as int).toList();
+    final visibleOrderIds = tabs
+        .map((t) => _normalizeOrderId(t['orderId']))
+        .whereType<int>()
+        .toList();
 
     final int? activeId = orderHelper.activeOrderId;
 
@@ -417,21 +492,25 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         await orderHelper.setActiveOrder(newActiveId);
         await orderHelper.saveLastActiveOrderId(newActiveId);
 
-        // 🔄 Update customer display for new order
-        await CustomerDisplayHelper.updateCustomerDisplay(newActiveId);
+        // ✅ ONLY update display if active order exists
+        if (newActiveId != 0) {
+          print("✅ Showing new active order on display → $newActiveId");
+          await CustomerDisplayHelper.updateCustomerDisplay(newActiveId);
+        }
+
       } else {
         // ❌ NO orders left → FULL RESET
         await orderHelper.setActiveOrder(null);
-        //await orderHelper.saveLastActiveOrderId(null);
 
-        // ⛔ CLEAR UI STATE
         if (mounted) {
           setState(() {
             orderItems.clear();
           });
         }
 
-        // ⛔ CRITICAL: RESET CUSTOMER DISPLAY
+        print("✅ No active orders → showing welcome screen");
+
+        // ✅ ALWAYS fallback to welcome when no orders
         await CustomerDisplayService.showWelcome();
       }
     }
@@ -511,20 +590,27 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 
   // Build #1.0.10: Fetches order items for the active order
   Future<void> fetchOrderItems() async {
-    // 🔥 CRITICAL FIX: Clear orderItems IMMEDIATELY to prevent stale data flash
-    if (mounted) {
-      setState(() {
-        orderItems = [];
-      });
-    }
+    final int requestId = ++_fetchOrderItemsRequestId;
 
     final activeId = orderHelper.activeOrderId;
+    // #region agent log
+    unawaited(_agentDebugLog(
+      hypothesisId: "H3",
+      location: "widget_order_panel.dart:fetchOrderItems:start",
+      message: "fetchOrderItems entry",
+      data: {
+        "activeOrderId": activeId,
+        "tabCount": tabs.length,
+        "hasActiveTab":
+            activeId != null && tabs.any((t) => t['orderId'] == activeId),
+      },
+    ));
+    // #endregion
 
-    if (activeId == null || !tabs.any((t) => t['orderId'] == activeId)) {
+    if (activeId == null) {
       if (kDebugMode) {
-        print("⛔ fetchOrderItems blocked — active order hidden");
+        print("⛔ fetchOrderItems — no active order, clearing list");
       }
-
       if (mounted) {
         setState(() {
           orderItems.clear();
@@ -532,6 +618,16 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         });
       }
       return;
+    }
+
+    // Tabs can lag behind activeOrderId (e.g. while _getOrderTabs runs, or offline-only).
+    // Never clear the cart just because the tab bar has not caught up yet.
+    if (!_tabsContainActiveOrder(activeId)) {
+      if (kDebugMode) {
+        print(
+          "⚠️ fetchOrderItems — active order not in tab bar; still loading by id: $activeId",
+        );
+      }
     }
 
     if (kDebugMode) {
@@ -543,9 +639,28 @@ class _RightOrderPanelState extends State<RightOrderPanel>
             "##### DEBUG: order panel fetchOrderItems - Fetching items for activeOrderId: ${orderHelper.activeOrderId}");
       }
       try {
-        // 1️⃣ Prefer offline storage (products added via addItemToOrder)
-        final offlineItems = await orderHelper
-            .getOrderItemsFromOffline(orderHelper.activeOrderId!);
+        final int oid = orderHelper.activeOrderId!;
+        // 1️⃣ Prefer offline storage; 2️⃣ SQLite — run both reads in parallel when offline may be empty.
+        final Future<List<Map<String, dynamic>>> offlineFuture =
+            orderHelper.getOrderItemsFromOffline(oid);
+        final Future<List<Map<String, dynamic>>> ordersFuture =
+            orderHelper.getOrderById(oid);
+        final offlineItems = await offlineFuture;
+        if (requestId != _fetchOrderItemsRequestId) return;
+        // #region agent log
+        unawaited(_agentDebugLog(
+          hypothesisId: "H3",
+          location: "widget_order_panel.dart:fetchOrderItems:offlineRead",
+          message: "offline items read",
+          data: {
+            "activeOrderId": orderHelper.activeOrderId,
+            "offlineItemCount": offlineItems.length,
+            "firstItemKeys": offlineItems.isNotEmpty
+                ? offlineItems.first.keys.take(8).toList()
+                : <String>[],
+          },
+        ));
+        // #endregion
         if (offlineItems.isNotEmpty) {
           if (kDebugMode) {
             print(
@@ -553,6 +668,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
           }
           if (mounted) {
             setState(() {
+              if (requestId != _fetchOrderItemsRequestId) return;
               orderItems = List<Map<String, dynamic>>.from(offlineItems);
               _listVersion++;
             });
@@ -561,17 +677,19 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         }
 
         // 2️⃣ Fallback to SQLite (synced/API orders)
-        var orders = await orderHelper.getOrderById(orderHelper.activeOrderId!);
+        var orders = await ordersFuture;
+        if (requestId != _fetchOrderItemsRequestId) return;
         if (orders.isEmpty) {
           if (kDebugMode) {
             print(
                 "##### DEBUG: fetchOrderItems - No order found for activeOrderId: ${orderHelper.activeOrderId}, clearing items");
           }
-          setState(() {
-            orderItems = []; // Clear items if no order exists
-            orderHelper.activeOrderId = null; // Reset activeOrderId
-          });
-          //   await orderHelper.saveLastActiveOrderId(null); // Clear saved activeOrderId
+          await orderHelper.clearPersistedCartSelection();
+          if (mounted) {
+            setState(() {
+              orderItems = []; // Clear items if no order exists
+            });
+          }
           await _getOrderTabs(); // Refresh tabs to reflect no active order
           return;
         }
@@ -586,6 +704,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         }
         List<Map<String, dynamic>> items =
             await orderHelper.getOrderItems(order[AppDBConst.orderServerId]);
+        if (requestId != _fetchOrderItemsRequestId) return;
         if (kDebugMode) {
           print(
               "##### DEBUG: fetchOrderItems - Retrieved ${items.length} items: $items");
@@ -593,6 +712,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 
         if (mounted) {
           setState(() {
+            if (requestId != _fetchOrderItemsRequestId) return;
             orderItems =
                 List<Map<String, dynamic>>.from(items); // Create mutable copy
             _listVersion++; // Build 1.0.214: Increment version when items change
@@ -646,7 +766,11 @@ class _RightOrderPanelState extends State<RightOrderPanel>
     if (!mounted) return;
     if (tabs.isEmpty) {
       orderHelper.activeOrderId = null;
-      orderItems = [];
+      if (mounted) {
+        setState(() => orderItems = []);
+      } else {
+        orderItems = [];
+      }
 
       final storeInfo = PinakaPreferences.getLoggedInStore();
       if (storeInfo.isNotEmpty) {
@@ -663,16 +787,42 @@ class _RightOrderPanelState extends State<RightOrderPanel>
       return;
     }
 
-    _tabController?.dispose();
+    // 1️⃣ Calculate Default Index BEFORE creating controller
+    int defaultIndex = 0;
+    if (orderHelper.activeOrderId != null) {
+      final idx = tabs.indexWhere(
+        (t) => _normalizeOrderId(t["orderId"]) == orderHelper.activeOrderId,
+      );
 
-    _tabController = TabController(length: tabs.length, vsync: this);
+      if (idx != -1) {
+        defaultIndex = idx;
+      } else {
+        // Fallback to first tab if active order not visible
+        defaultIndex = 0;
+        final fallbackOrderId = _normalizeOrderId(tabs[0]["orderId"]) ?? 0;
+        if (fallbackOrderId != 0) {
+          await orderHelper.setActiveOrder(fallbackOrderId);
+          await orderHelper.saveLastActiveOrderId(fallbackOrderId);
+        }
+      }
+    }
+
+    // 2️⃣ Initialize TabController with initialIndex
+    _tabController?.dispose();
+    _tabController = TabController(
+      length: tabs.length,
+      vsync: this,
+      initialIndex: defaultIndex,
+    );
 
     _tabController!.addListener(() async {
       if (!_tabController!.indexIsChanging &&
           mounted &&
           _tabController!.index < tabs.length) {
         int selectedIndex = _tabController!.index;
-        int selectedOrderId = tabs[selectedIndex]["orderId"] as int;
+        final int? selectedOrderId =
+            _normalizeOrderId(tabs[selectedIndex]["orderId"]);
+        if (selectedOrderId == null) return;
         if (mounted) {
           setState(() {
             orderItems = [];
@@ -681,36 +831,20 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         await orderHelper.setActiveOrder(selectedOrderId);
         await orderHelper.saveLastActiveOrderId(selectedOrderId);
         await fetchOrderItems();
-        await CustomerDisplayHelper.updateCustomerDisplay(selectedOrderId);
+        CustomerDisplayHelper.updateCustomerDisplay(selectedOrderId);
 
         if (mounted) setState(() {});
       }
     });
 
-    int defaultIndex = 0;
-
-    if (orderHelper.activeOrderId != null) {
-      final idx = tabs.indexWhere(
-        (t) => t["orderId"] == orderHelper.activeOrderId,
-      );
-
-      if (idx != -1) {
-        defaultIndex = idx;
-      } else {
-        //  Active order not found → fallback to first tab
-        defaultIndex = 0;
-
-        final fallbackOrderId = tabs[0]["orderId"] as int;
-        await orderHelper.setActiveOrder(fallbackOrderId);
-        await orderHelper.saveLastActiveOrderId(fallbackOrderId);
-      }
-    }
-
+    // 3️⃣ Final UI Sync
     if (mounted) {
-      _tabController!.index = defaultIndex;
-      await CustomerDisplayHelper.updateCustomerDisplay(
-        tabs[defaultIndex]["orderId"] as int,
-      );
+      final activeTabOrderId =
+          _normalizeOrderId(tabs[defaultIndex]["orderId"]) ?? 0;
+      if (activeTabOrderId != 0) {
+        CustomerDisplayHelper.updateCustomerDisplay(activeTabOrderId);
+      }
+      setState(() {}); // Ensure UI highlights the correct tab
     }
   }
 
@@ -720,7 +854,112 @@ class _RightOrderPanelState extends State<RightOrderPanel>
   // Updated UI (tabs, tab controller, items) after API success.
   // Added alert dialog for error handling with retry option.
   // Loader is shown via _isLoading during the API call.
-  Future<void> addNewTab() async {
+  Future<void> addNewTab() async {Future<void> addNewTab() async {
+    if (_isNewTabDisabled) return;
+
+    setState(() {
+      _isNewTabDisabled = true;
+    });
+
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => _isNewTabDisabled = false);
+      }
+    });
+
+    if (kDebugMode) {
+      print("##### DEBUG: addNewTab - Creating new order");
+    }
+
+    showLogs = true;
+    logString += "##### DEBUG: addNewTab - Creating new order \n ";
+
+    setState(() => _isLoading = true);
+
+    _updateOrderSubscription?.cancel();
+    _updateOrderSubscription =
+        orderBloc.createOrderStream.listen((response) async {
+          if (!mounted) return;
+
+          if (response.status == Status.COMPLETED) {
+            setState(() => _isLoading = false);
+
+            final orderId = response.data!.id;
+
+            if (kDebugMode) {
+              print("##### Order created: $orderId");
+            }
+
+            // ✅ Save order locally
+            await orderHelper.createOrder(serverOrderId: orderId);
+
+            // ✅ Set active order
+            await orderHelper.setActiveOrder(orderId);
+            await orderHelper.saveLastActiveOrderId(orderId);
+
+            // 🔥🔥🔥 ADD THIS BLOCK (IMPORTANT)
+            await CustomerDisplayService.showCustomerData(
+              orderId: orderId,
+              items: [],
+              grossTotal: 0.0,
+              discount: 0.0,
+              merchantDiscount: 0.0,
+              netTotal: 0.0,
+              tax: 0.0,
+              netPayable: 0.0,
+              orderDate: "",
+              orderTime: "",
+              cashbackFee: 0.0,
+              loyaltyContact: "",
+              summaryEnabled: false,
+              discountType: "NONE",
+              discountValue: 0.0,
+            );
+            // 🔥🔥🔥 END FIX
+
+            // ✅ Add tab
+            setState(() {
+              tabs.add({
+                "title": "$orderId",
+                "subtitle": "Tab ${tabs.length + 1}",
+                "orderId": orderId as Object,
+              });
+            });
+
+            _initializeTabController();
+            _tabController?.index = tabs.length - 1;
+            _scrollToSelectedTab();
+
+            await fetchOrderItems();
+
+            // ✅ Optional: keep this (will refresh if data comes later)
+            await CustomerDisplayHelper.updateCustomerDisplay(orderId);
+
+            if (Misc.showDebugSnackBar) {
+              _scaffoldMessenger.showSnackBar(
+                const SnackBar(
+                  content: Text("Order created successfully"),
+                  backgroundColor: Colors.green,
+                  duration: Duration(seconds: 2),
+                ),
+              );
+            }
+          } else if (response.status == Status.ERROR) {
+            setState(() => _isLoading = false);
+
+            _scaffoldMessenger.showSnackBar(
+              SnackBar(
+                content: Text(response.message ?? "Failed to create order"),
+                backgroundColor: Colors.red,
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          }
+        });
+
+    logString += await orderBloc.createOrder();
+    setState(() {});
+  }
     if (_isNewTabDisabled) return; // 🔒 hard guard
 
     setState(() {
@@ -897,6 +1136,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 
   @override
   void dispose() {
+    NativeUsbScanBridge.unregisterHandler(_onNativeUsbBarcode);
     WidgetsBinding.instance.removeObserver(this);
     _updateOrderSubscription?.cancel(); // Cancel the subscription
     //orderBloc.dispose(); // Dispose the bloc if needed
@@ -987,118 +1227,97 @@ class _RightOrderPanelState extends State<RightOrderPanel>
   //   _onBarcodeScannedCallback.call(barcode);
   // }
   // final GlobalKey<BarcodeKeyboardListenerState> _scannerKey = GlobalKey();//Build #1.0.268: 2. create global key
-  @override
-  Widget build(BuildContext context) {
-    final themeHelper = Provider.of<ThemeNotifier>(context);
-    return FocusDetector(
-      onFocusLost: () {
-        // Build #1.0.219 -> FIXED ISSUE [SCRUM - 366] : Swipe-to-Delete UI State Not Resetting
-        // When this widget regains focus, reset slidable states
-        if (!mounted) return;
-        setState(() {
-          _listVersion++;
-        });
-      },
-      child: BarcodeKeyboardListener(
-        // Build #1.0.44 : Added - Wrap with BarcodeKeyboardListener for barcode scanning
-        // key:  _scannerKey,//Build #1.0.268: 3. Add key for scanner event
-        bufferDuration: const Duration(milliseconds: 700),
-        //Build #1.0.78: Removed orderHelper.addItemToOrder from the API success block, as it’s now in OrderBloc.updateOrderProducts.
-        // Kept local addItemToOrder for non-API orders.
-        // Ensured loader is shown during API calls and hidden afterward.
-        useKeyDownEvent: Platform.isWindows,
-        caseSensitive: true,
-        onBarcodeScanned: (barcode) async {
-          if (ScannerMutex.noOrderBusy) {
-            print("🚫 BLOCKED BY ScannerMutex.noOrderBusy");
-            return;
-          }
+  Future<void> _handleOrderPanelBarcode(String barcode) async {
+    if (ScannerMutex.noOrderBusy) {
+      print("🚫 BLOCKED BY ScannerMutex.noOrderBusy");
+      return;
+    }
 
-          if (ScannerGuard.isCouponPopupOpen) {
-            if (kDebugMode) {
-              print("🚫 Scanner blocked (OrderSummary / Popup / Payment)");
-            }
-            return;
-          }
+    if (ScannerGuard.isCouponPopupOpen) {
+      if (kDebugMode) {
+        print("🚫 Scanner blocked (OrderSummary / Popup / Payment)");
+      }
+      return;
+    }
 
-          //  ⛔ HARD BLOCK — prevents duplicate scans
-          if (_scanLocked) return;
+    //  ⛔ HARD BLOCK — prevents duplicate scans
+    if (_scanLocked) return;
 
-          // 🛡️ SOFTWARE DEBOUNCE BLOCK — Prevents duplicate physical scanner bursts
-          final now = DateTime.now();
-          final sanitizedBarcode = OrderHelper.normalizeSku(barcode);
-          if (sanitizedBarcode == _lastScannedBarcode &&
-              _lastScanTime != null) {
-            if (now.difference(_lastScanTime!).inMilliseconds < 1500) {
-              if (kDebugMode)
-                print(
-                    "🚫 Ignored debounced duplicate scan for $sanitizedBarcode");
-              return;
-            }
-          }
-          _lastScannedBarcode = sanitizedBarcode;
-          _lastScanTime = now;
+    // 🛡️ SOFTWARE DEBOUNCE BLOCK — Prevents duplicate physical scanner bursts
+    final now = DateTime.now();
+    final sanitizedBarcode = OrderHelper.normalizeSku(barcode);
+    if (sanitizedBarcode == _lastScannedBarcode && _lastScanTime != null) {
+      if (now.difference(_lastScanTime!).inMilliseconds < 1500) {
+        if (kDebugMode)
+          print("🚫 Ignored debounced duplicate scan for $sanitizedBarcode");
+        return;
+      }
+    }
+    _lastScannedBarcode = sanitizedBarcode;
+    _lastScanTime = now;
 
-          final trimmedBarcode = barcode;
+    final trimmedBarcode = barcode;
 
-          // ⛔ Ignore junk frames
-          if (trimmedBarcode.length < 6) return;
-          try {
-            final trimmedBarcode = barcode;
-            if (kDebugMode) print("🔹 Scanned → $trimmedBarcode");
+    // ⛔ Ignore junk frames
+    if (trimmedBarcode.length < 6) return;
+    _scanLocked = true;
+    try {
+      final trimmedBarcode = barcode;
+      if (kDebugMode) print("🔹 Scanned → $trimmedBarcode");
 
-            final upper = trimmedBarcode.toUpperCase();
+      final upper = trimmedBarcode.toUpperCase();
 
-            final bool isDriverLicense = upper.contains("ANSI") ||
-                upper.contains("DBB") ||
-                upper.contains("DAQ") ||
-                upper.contains("DL");
+      final bool isDriverLicense = upper.contains("ANSI") ||
+          upper.contains("DBB") ||
+          upper.contains("DAQ") ||
+          upper.contains("DL");
 
-            if (isDriverLicense) {
-              if (kDebugMode) {
-                print("🪪 Driver License detected → stopping product flow");
-                print("🪪 DRIVER LICENSE RAW BARCODE ↓↓↓");
-                print(trimmedBarcode); // ✅ FULL PDF417 DATA
-                print("🪪 DRIVER LICENSE RAW BARCODE ↑↑↑");
-              }
-              _ageVerificationActive = true;
-              _scanLocked = true;
+      if (isDriverLicense) {
+        if (kDebugMode) {
+          print("🪪 Driver License detected → stopping product flow");
+          print("🪪 DRIVER LICENSE RAW BARCODE ↓↓↓");
+          print(trimmedBarcode); // ✅ FULL PDF417 DATA
+          print("🪪 DRIVER LICENSE RAW BARCODE ↑↑↑");
+        }
+        _ageVerificationActive = true;
+        _scanLocked = true;
 
-              // ⏳ Absorb trailing scanner frames
-              await Future.delayed(const Duration(milliseconds: 1200));
+        // ⏳ Absorb trailing scanner frames
+        await Future.delayed(const Duration(milliseconds: 1200));
 
-              _ageVerificationActive = false;
-              _scanLocked = false;
+        _ageVerificationActive = false;
+        _scanLocked = false;
 
-              // 🔥 VERY IMPORTANT — STOP HERE
-              return;
-            }
+        // 🔥 VERY IMPORTANT — STOP HERE
+        return;
+      }
 
-            if (!isOrderInForeground ||
-                trimmedBarcode.isEmpty ||
-                _isLoading ||
-                _isCustomItemLoading) return;
+      if (!isOrderInForeground ||
+          trimmedBarcode.isEmpty ||
+          _isLoading ||
+          _isCustomItemLoading) return;
 
-            _isLoading = true;
-            if (mounted) setState(() {});
-            final orderHelper = OrderHelper();
-            final ensuredOrderId = await orderHelper.ensureOrderExists();
+      _isLoading = true;
+      if (mounted) setState(() {});
+      final orderHelper = OrderHelper();
+      final ensuredOrderId = await orderHelper.ensureOrderExists();
 
-            if (ensuredOrderId == null) {
-              print("❌ Scanner: Failed to create or restore order");
-              _isLoading = false;
-              if (mounted) setState(() {});
-              return;
-            }
+      if (ensuredOrderId == null) {
+        print("❌ Scanner: Failed to create or restore order");
+        _isLoading = false;
+        if (mounted) setState(() {});
+        await _openCustomItemDialog(context, trimmedBarcode);
+        return;
+      }
 
-            final activeOrderId = ensuredOrderId;
-            final productBox = StorageProvider.productCache;
-            final normalizedBarcode = OrderHelper.normalizeSku(trimmedBarcode);
-            final cacheKey = "sku_$normalizedBarcode";
+      final activeOrderId = ensuredOrderId;
+      final productBox = StorageProvider.productCache;
+      final normalizedBarcode = OrderHelper.normalizeSku(trimmedBarcode);
+      final cacheKey = "sku_$normalizedBarcode";
 
-            SKU.ProductBySkuResponse? product;
-            bool foundOffline = false;
-            // unused local normalizedSku was removed
+      SKU.ProductBySkuResponse? product;
+      bool foundOffline = false;
+      // unused local normalizedSku was removed
 
 // The synchronous backend validation that bypassed cache was removed to restore instantaneous scanning speeds.
 
@@ -1138,836 +1357,937 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 //               await _openCustomItemDialog(context, trimmedBarcode);
 //               return;
 //             }
-            // ---------------------------------------------------------------------------
-            // 1️⃣ MEMORY CACHE
-            // ---------------------------------------------------------------------------
+      // ---------------------------------------------------------------------------
+      // 1️⃣ MEMORY CACHE
+      // ---------------------------------------------------------------------------
 // 1️⃣ MEMORY CACHE
 // ---------------------------------------------------------------------------
+      try {
+        final memoryData = OrderHelper.getFromCache(trimmedBarcode);
+
+        if (memoryData != null) {
+          if (kDebugMode) {
+            print("💾 MEMORY CACHE HIT");
+            print("💾 memoryData (raw) → $memoryData");
             try {
-              final memoryData = OrderHelper.getFromCache(trimmedBarcode);
+              print("💾 memoryData (json) → ${jsonEncode(memoryData)}");
+            } catch (_) {
+              print("💾 memoryData NOT JSON serializable");
+            }
+          }
 
-              if (memoryData != null) {
-                if (kDebugMode) {
-                  print("💾 MEMORY CACHE HIT");
-                  print("💾 memoryData (raw) → $memoryData");
-                  try {
-                    print("💾 memoryData (json) → ${jsonEncode(memoryData)}");
-                  } catch (_) {
-                    print("💾 memoryData NOT JSON serializable");
-                  }
-                }
+          Map<String, dynamic> productMap;
 
-                Map<String, dynamic> productMap;
+          // Case A → stored as {products:[{...}]}
+          if (memoryData is Map &&
+              memoryData["products"] is List &&
+              memoryData["products"].isNotEmpty) {
+            productMap = Map<String, dynamic>.from(memoryData["products"][0]);
 
-                // Case A → stored as {products:[{...}]}
-                if (memoryData is Map &&
-                    memoryData["products"] is List &&
-                    memoryData["products"].isNotEmpty) {
-                  productMap =
-                      Map<String, dynamic>.from(memoryData["products"][0]);
+            // 🔐 Restore meta_data safely
+            if (productMap["meta_data"] is List) {
+              productMap["meta_data"] =
+                  List<Map<String, dynamic>>.from(productMap["meta_data"]);
+            }
 
-                  // 🔐 Restore meta_data safely
-                  if (productMap["meta_data"] is List) {
-                    productMap["meta_data"] = List<Map<String, dynamic>>.from(
-                        productMap["meta_data"]);
-                  }
+            // 🔐 Restore tags safely
+            if (productMap["tags"] is List) {
+              productMap["tags"] =
+                  List<Map<String, dynamic>>.from(productMap["tags"]);
+            }
+          }
 
-                  // 🔐 Restore tags safely
-                  if (productMap["tags"] is List) {
-                    productMap["tags"] =
-                        List<Map<String, dynamic>>.from(productMap["tags"]);
-                  }
-                }
-
-                // Case B → stored as flat map
-                else {
-                  productMap = Map<String, dynamic>.from(memoryData);
-                }
-                // 🔥 FIX FOR CUSTOM ITEM RE-SCAN 🔥
-                if (productMap.containsKey('product') &&
-                    productMap['product'] is Map<String, dynamic>) {
-                  productMap = Map<String, dynamic>.from(productMap['product']);
-                }
+          // Case B → stored as flat map
+          else {
+            productMap = Map<String, dynamic>.from(memoryData);
+          }
+          // 🔥 FIX FOR CUSTOM ITEM RE-SCAN 🔥
+          if (productMap.containsKey('product') &&
+              productMap['product'] is Map<String, dynamic>) {
+            productMap = Map<String, dynamic>.from(productMap['product']);
+          }
 
 // ✅ STORE FINAL MAP FOR LATER USE
-                resolvedProductMap = productMap;
+          resolvedProductMap = productMap;
 
-                if (kDebugMode) {
-                  print("💾 Extracted productMap from memory → $productMap");
-                  try {
-                    print("💾 productMap JSON → ${jsonEncode(productMap)}");
-                  } catch (_) {
-                    print("💾 productMap not JSON encodable");
-                  }
-                  // ⭐⭐⭐ ADD THESE THREE ⭐⭐⭐
-                  print(
-                      "🖼 MEMORY productMap['images'] → ${productMap['images']}");
-
-                  if (productMap['images'] is List &&
-                      productMap['images'].isNotEmpty) {
-                    print(
-                        "🖼 MEMORY image src → ${productMap['images'][0]['src']}");
-                  } else {
-                    print("🖼 MEMORY image src → NONE");
-                  }
-                }
-
-                product = SKU.ProductBySkuResponse.fromJson(productMap);
-                foundOffline = true;
-
-                if (kDebugMode) {
-                  print(
-                      "🧠 MEMORY → PRODUCT → name=${product?.name}, price=${product?.price}, sku=${product?.sku}");
-                }
-              }
-            } catch (e, s) {
-              print("❌ MEMORY CACHE ERROR → $e");
-              print("📌 STACKTRACE → $s");
+          if (kDebugMode) {
+            print("💾 Extracted productMap from memory → $productMap");
+            try {
+              print("💾 productMap JSON → ${jsonEncode(productMap)}");
+            } catch (_) {
+              print("💾 productMap not JSON encodable");
             }
+            // ⭐⭐⭐ ADD THESE THREE ⭐⭐⭐
+            print("🖼 MEMORY productMap['images'] → ${productMap['images']}");
+
+            if (productMap['images'] is List &&
+                productMap['images'].isNotEmpty) {
+              print("🖼 MEMORY image src → ${productMap['images'][0]['src']}");
+            } else {
+              print("🖼 MEMORY image src → NONE");
+            }
+          }
+
+          product = SKU.ProductBySkuResponse.fromJson(productMap);
+          foundOffline = true;
+
+          if (kDebugMode) {
+            print(
+                "🧠 MEMORY → PRODUCT → name=${product?.name}, price=${product?.price}, sku=${product?.sku}");
+          }
+        }
+      } catch (e, s) {
+        print("❌ MEMORY CACHE ERROR → $e");
+        print("📌 STACKTRACE → $s");
+      }
 
 // ---------------------------------------------------------------------------
 // 2️⃣ PRODUCT CACHE (Custom Items + Normal SKU)
 // ---------------------------------------------------------------------------
-            try {
-              if (product == null) {
-                final cached = await productBox.get(cacheKey); // <-- await here
+      try {
+        if (product == null) {
+          final cached = await productBox.get(cacheKey); // <-- await here
 
-                if (cached != null) {
-                  if (kDebugMode) {
-                    print("💽 HIVE productCache[$cacheKey] RAW → $cached");
-                    try {
-                      print("💽 HIVE JSON → ${jsonEncode(cached)}");
-                    } catch (_) {
-                      print("💽 HIVE map not JSON encodable");
-                    }
-                  }
-
-                  List<dynamic> items = [];
-
-                  if (cached is Map && cached["products"] is List) {
-                    items = List<dynamic>.from(cached["products"]); // safe copy
-                  }
-
-                  if (items.isNotEmpty) {
-                    final productMap = Map<String, dynamic>.from(items[0]);
-
-                    if (kDebugMode) {
-                      print("💽 Extracted productMap from Hive → $productMap");
-                      try {
-                        print("💽 productMap JSON → ${jsonEncode(productMap)}");
-                      } catch (_) {
-                        print("💽 productMap not JSON encodable");
-                      }
-                    }
-
-                    product = SKU.ProductBySkuResponse.fromJson(productMap);
-                    resolvedProductMap = productMap;
-                    foundOffline = true;
-
-                    if (kDebugMode) {
-                      print(
-                          "🟢 productCache → PRODUCT → name=${product?.name}, price=${product?.price}");
-                    }
-                  }
-                }
-              }
-            } catch (e, s) {
-              print("❌ PRODUCT CACHE ERROR → $e");
-              print("📌 STACKTRACE → $s");
-            }
-            // Removed redundant auto-increment logic.
-            // All scans now proceed to product resolution below.
-
-            // ---------------------------------------------------------------------------
-            // 4️⃣ FULL LIST CACHE
-            // ---------------------------------------------------------------------------
-            try {
-              if (product == null) {
-                final allData = productBox.get("all_products_list");
-
-                if (allData is List) {
-                  for (var item in await allData) {
-                    final p = SKU.ProductBySkuResponse.fromJson({
-                      "products": [deepCast(item)]
-                    });
-                    if ((p.sku ?? "").toLowerCase() ==
-                        trimmedBarcode.toLowerCase()) {
-                      product = p;
-                      foundOffline = true;
-                      break;
-                    }
-                  }
-                }
-              }
-            } catch (e) {
-              if (kDebugMode) print("⚠ full list error: $e");
-            }
-
-            // ---------------------------------------------------------------------------
-            // 5️⃣ ONLINE API FETCH
-            // ---------------------------------------------------------------------------
-            if (product == null) {
-              try {
-                final products =
-                    await ProductRepository().fetchProductBySku(trimmedBarcode);
-
-                if (products.isNotEmpty) {
-                  product = products.first;
-
-                  await productBox.put(cacheKey, {
-                    "products": products.map((p) {
-                      final map = p.toJson();
-
-                      // 🔥 FIX: Persist tags
-                      map["tags"] = p.tags
-                          ?.map((t) => {
-                                "id": t.id,
-                                "name": t.name,
-                                "slug": t.slug,
-                              })
-                          .toList();
-
-                      // 🔥 Also persist meta_data if present
-                      map["meta_data"] = p.metaData
-                          ?.map((m) => {
-                                "key": m.key,
-                                "value": m.value,
-                              })
-                          .toList();
-
-                      return map;
-                    }).toList(),
-                  });
-
-                  if (kDebugMode) print("🌐 Online fetch → ${product?.name}");
-                }
-              } catch (e) {
-                print("📴 API error: $e");
-              }
-            }
-
-            // ---------------------------------------------------------------------------
-            // 6️⃣ STILL NULL → CUSTOM ITEM POPUP
-            // ---------------------------------------------------------------------------
-            // 6️⃣ STILL NULL → CUSTOM ITEM POPUP
-            if (product == null) {
-              // ❌ Block only if scanner or age flow is active
-              if (_scanLocked || _ageVerificationActive || isDriverLicense) {
-                if (kDebugMode) {
-                  print("🚫 Custom Item popup BLOCKED (DL / Age / Locked)");
-                }
-
-                _isLoading = false;
-                if (mounted) setState(() {});
-                return;
-              }
-
-              // ✅ Stop loader BEFORE opening popup
-              _isLoading = false;
-              if (mounted) setState(() {});
-
-              // ✅ PASS BARCODE HERE
-              await _openCustomItemDialog(context, trimmedBarcode);
-
-              return;
-            }
-
-            // ---------------------------------------------------------------------------
-            // 7️⃣ EXTRACT PRODUCT DATA
-            // ---------------------------------------------------------------------------
-            final bool isCustomItem = product.id == null ||
-                product.id == 0 ||
-                product.type == 'custom';
-
-            final productId = product.id ?? 0;
-
-            final productName = isCustomItem
-                ? (resolvedProductMap?['name'] ?? 'Custom Item').toString()
-                : (product.name ?? 'Unnamed Product');
-
-            final productSku = isCustomItem
-                ? (resolvedProductMap?['sku'] ?? trimmedBarcode).toString()
-                : (product.sku ?? trimmedBarcode);
-
-            final productPrice = isCustomItem
-                ? double.tryParse(
-                      resolvedProductMap?['price']?.toString() ?? '0',
-                    ) ??
-                    0.0
-                : double.tryParse(product.price?.toString() ?? '0') ?? 0.0;
-
-            final int? selectedVariationId =
-                (product.variations != null && product.variations!.isNotEmpty)
-                    ? null // variant not selected yet
-                    : null;
-
-            final taxStatus = isCustomItem
-                ? (resolvedProductMap?['tax_status'] ?? '').toString()
-                : (product.taxStatus ?? '');
-            final taxClass = isCustomItem
-                ? (resolvedProductMap?['tax_class'] ?? '').toString()
-                : (product.taxClass ?? '');
-            final taxRate = isCustomItem
-                ? double.tryParse(
-                        resolvedProductMap?['tax_rate']?.toString() ?? '0') ??
-                    0.0
-                : 0.0;
-
-// 🖼 Image
-            String image = "";
-            if ((product.images ?? []).isNotEmpty) {
-              image = product.images!.first.src ?? "";
-            }
-
-// 🧠 Metadata & Tags
-            final metaData = product.metaData ?? [];
-            final tags = product.tags ?? [];
-
+          if (cached != null) {
             if (kDebugMode) {
-              debugPrint("──────── PRODUCT DEBUG ────────");
-              debugPrint("ID        : $productId");
-              debugPrint("Name      : $productName");
-              debugPrint("SKU       : $productSku");
-              debugPrint("Price     : $productPrice");
-              debugPrint("Image     : $image");
-
-              // 🧠 META DATA
-              if (metaData.isNotEmpty) {
-                debugPrint("📦 META DATA:");
-                for (final m in metaData) {
-                  debugPrint("  • ${m.key} = ${m.value}");
-                }
-              } else {
-                debugPrint("📦 META DATA: none");
+              print("💽 HIVE productCache[$cacheKey] RAW → $cached");
+              try {
+                print("💽 HIVE JSON → ${jsonEncode(cached)}");
+              } catch (_) {
+                print("💽 HIVE map not JSON encodable");
               }
-
-              // 🏷 TAGS
-              if (tags.isNotEmpty) {
-                debugPrint("🏷 TAGS:");
-                for (final tag in tags) {
-                  debugPrint("  • ${tag.name ?? tag.slug ?? tag.id}");
-                }
-              } else {
-                debugPrint("🏷 TAGS: none");
-              }
-
-              debugPrint("──────────────────────────────");
             }
-            // SKIP POPUP IF PRODUCT ALREADY EXISTS IN ORDERPANEL
-// ------------------------------------------------------------
-            final bool exists = await OrderHelper.existsInOrderBySku(
-              activeOrderId,
-              productSku,
-            );
-            // ------------------------------------------------------------
-// 🔥 FINAL BACKEND EXISTENCE CHECK
-// ------------------------------------------------------------
-            bool existsInBackend = false;
 
-            try {
-              final apiProducts = await ProductRepository()
-                  .fetchProductBySku(normalizedBarcode, forceRefresh: true);
+            List<dynamic> items = [];
 
-              existsInBackend = apiProducts.isNotEmpty;
+            if (cached is Map && cached["products"] is List) {
+              items = List<dynamic>.from(cached["products"]); // safe copy
+            }
+
+            if (items.isNotEmpty) {
+              final productMap = Map<String, dynamic>.from(items[0]);
 
               if (kDebugMode) {
-                print("🌐 Backend fresh validation → $existsInBackend");
-              }
-            } catch (e) {
-              print("⚠ Backend validation failed: $e");
-            }
-// 🚨 If backend says product does NOT exist
-            if (!existsInBackend && !isCustomItem) {
-              print(
-                  "⛔ Backend confirms product deleted → cleaning ALL local cache");
-
-              // 🧠 MEMORY
-              OrderHelper.removeFromCache(normalizedBarcode);
-
-              // 💽 SKU CACHE
-              await StorageProvider.productCache
-                  .delete("sku_$normalizedBarcode");
-
-              // 🗑 REMOVE FROM FULL LIST CACHE (SAFE VERSION)
-              final allProducts =
-                  await StorageProvider.productCache.get("all_products_list");
-
-              if (allProducts is List) {
-                final updated = allProducts.where((item) {
-                  try {
-                    // Case 1: Flat product map
-                    if (item is Map && item["sku"] != null) {
-                      final sku = item["sku"].toString().toLowerCase();
-                      return sku != normalizedBarcode.toLowerCase();
-                    }
-
-                    // Case 2: Wrapped inside {products:[...]}
-                    if (item is Map &&
-                        item["products"] is List &&
-                        item["products"].isNotEmpty) {
-                      final first = item["products"][0];
-                      final sku = (first["sku"] ?? "").toString().toLowerCase();
-                      return sku != normalizedBarcode.toLowerCase();
-                    }
-
-                    return true;
-                  } catch (_) {
-                    return true;
-                  }
-                }).toList();
-
-                await StorageProvider.productCache
-                    .put("all_products_list", updated);
+                print("💽 Extracted productMap from Hive → $productMap");
+                try {
+                  print("💽 productMap JSON → ${jsonEncode(productMap)}");
+                } catch (_) {
+                  print("💽 productMap not JSON encodable");
+                }
               }
 
-              print("🧹 Local cache fully cleaned for SKU: $normalizedBarcode");
+              product = SKU.ProductBySkuResponse.fromJson(productMap);
+              resolvedProductMap = productMap;
+              foundOffline = true;
 
-              _isLoading = false;
-              if (mounted) setState(() {});
-
-              await _openCustomItemDialog(context, trimmedBarcode);
-              return;
+              if (kDebugMode) {
+                print(
+                    "🟢 productCache → PRODUCT → name=${product?.name}, price=${product?.price}");
+              }
             }
+          }
+        }
+      } catch (e, s) {
+        print("❌ PRODUCT CACHE ERROR → $e");
+        print("📌 STACKTRACE → $s");
+      }
+      // Removed redundant auto-increment logic.
+      // All scans now proceed to product resolution below.
 
-            // ---------------------------------------------------------------------------
-// ⭐ FINAL EBT ELIGIBILITY CHECK (NOW PRODUCT IS LOADED) ✅
-// ---------------------------------------------------------------------------
-            bool isEbtEligible = false;
+      // ---------------------------------------------------------------------------
+      // 4️⃣ FULL LIST CACHE
+      // ---------------------------------------------------------------------------
+      try {
+        if (product == null) {
+          final allData = productBox.get("all_products_list");
 
-            try {
-              final tags = product?.tags ?? [];
-
-              isEbtEligible = tags.any((t) {
-                final name = (t.name ?? "").toLowerCase();
-                final slug = (t.slug ?? "").toLowerCase();
-
-                return name == "ebt" ||
-                    name == "ebt eligible" ||
-                    slug == "ebt" ||
-                    slug == "ebt-eligible";
+          if (allData is List) {
+            for (var item in await allData) {
+              final p = SKU.ProductBySkuResponse.fromJson({
+                "products": [deepCast(item)]
               });
-
-              print(
-                  "💳 FINAL EBT Eligible? → $isEbtEligible (via product.tags)");
-            } catch (e) {
-              print("⚠ EBT eligibility error → $e");
+              if ((p.sku ?? "").toLowerCase() == trimmedBarcode.toLowerCase()) {
+                product = p;
+                foundOffline = true;
+                break;
+              }
             }
+          }
+        }
+      } catch (e) {
+        if (kDebugMode) print("⚠ full list error: $e");
+      }
 
-            // 🔥 ONLY AUTO-INCREMENT NON-VARIANT PRODUCTS
-            if (exists && (product.variations ?? []).isEmpty) {
-              print("🔁 NON-VARIANT → Auto increment");
+      // ---------------------------------------------------------------------------
+      // 5️⃣ ONLINE API FETCH
+      // ---------------------------------------------------------------------------
+      if (product == null) {
+        try {
+          final products =
+              await ProductRepository().fetchProductBySku(trimmedBarcode);
 
-              await orderHelper.addItemToOrder(
-                productId,
-                productName,
-                image,
-                productPrice,
-                1,
-                productSku,
-                activeOrderId,
-                type: isCustomItem ? 'custom' : ItemType.product.value,
-                productId: productId,
-                isEbtEligible: isEbtEligible,
-                variationId: 0,
-                taxStatus: taxStatus,
-                taxClass: taxClass,
-                taxRate: taxRate,
-              );
+          if (products.isNotEmpty) {
+            product = products.first;
 
-              await fetchOrderItems();
-              await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
+            await productBox.put(cacheKey, {
+              "products": products.map((p) {
+                final map = p.toJson();
 
-              _isLoading = false;
-              if (mounted) setState(() {});
-              return; // 🚫 STOP HERE — POPUP NEVER OPENS
-            }
+                // 🔥 FIX: Persist tags
+                map["tags"] = p.tags
+                    ?.map((t) => {
+                          "id": t.id,
+                          "name": t.name,
+                          "slug": t.slug,
+                        })
+                    .toList();
 
-            // VARIABLE PRICE PRODUCT CHECK
-// ------------------------------------------------------------
-            final hasVariablePriceTag = (product.tags ?? []).any((tag) {
-              final name = (tag.name ?? "").toLowerCase();
-              final slug = (tag.slug ?? "").toLowerCase();
-              return name.contains("variable product") ||
-                  slug.contains("variable-product");
+                // 🔥 Also persist meta_data if present
+                map["meta_data"] = p.metaData
+                    ?.map((m) => {
+                          "key": m.key,
+                          "value": m.value,
+                        })
+                    .toList();
+
+                return map;
+              }).toList(),
             });
 
-            print("🧪 hasVariablePriceTag = $hasVariablePriceTag");
-            print("⏳ _isLoading before popup = $_isLoading");
+            if (kDebugMode) print("🌐 Online fetch → ${product?.name}");
+          }
+        } catch (e) {
+          print("📴 API error: $e");
+        }
+      }
+
+      // ---------------------------------------------------------------------------
+      // 6️⃣ STILL NULL → CUSTOM ITEM POPUP
+      // ---------------------------------------------------------------------------
+      // 6️⃣ STILL NULL → CUSTOM ITEM POPUP
+      if (product == null) {
+        // ❌ Block only if scanner or age flow is active
+        if (_ageVerificationActive || isDriverLicense) {
+          if (kDebugMode) {
+            print("🚫 Custom Item popup BLOCKED (DL / Age / Locked)");
+          }
+
+          _isLoading = false;
+          if (mounted) setState(() {});
+          return;
+        }
+
+        // ✅ Stop loader BEFORE opening popup
+        _isLoading = false;
+        if (mounted) setState(() {});
+
+        // ✅ PASS BARCODE HERE
+        await _openCustomItemDialog(context, trimmedBarcode);
+
+        return;
+      }
+
+      // ---------------------------------------------------------------------------
+      // 7️⃣ EXTRACT PRODUCT DATA
+      // ---------------------------------------------------------------------------
+      final bool isCustomItem =
+          product.id == null || product.id == 0 || product.type == 'custom';
+
+      final productId = product.id ?? 0;
+
+      final productName = isCustomItem
+          ? (resolvedProductMap?['name'] ?? 'Custom Item').toString()
+          : (product.name ?? 'Unnamed Product');
+
+      final productSku = isCustomItem
+          ? (resolvedProductMap?['sku'] ?? trimmedBarcode).toString()
+          : (product.sku ?? trimmedBarcode);
+
+      final productPrice = isCustomItem
+          ? double.tryParse(
+                resolvedProductMap?['price']?.toString() ?? '0',
+              ) ??
+              0.0
+          : double.tryParse(product.price?.toString() ?? '0') ?? 0.0;
+
+      final int? selectedVariationId =
+          (product.variations != null && product.variations!.isNotEmpty)
+              ? null // variant not selected yet
+              : null;
+
+      final taxStatus = isCustomItem
+          ? (resolvedProductMap?['tax_status'] ?? '').toString()
+          : (product.taxStatus ?? '');
+      final taxClass = isCustomItem
+          ? (resolvedProductMap?['tax_class'] ?? '').toString()
+          : (product.taxClass ?? '');
+      final taxRate = isCustomItem
+          ? double.tryParse(
+                  resolvedProductMap?['tax_rate']?.toString() ?? '0') ??
+              0.0
+          : 0.0;
+
+// 🖼 Image
+      String image = "";
+      if ((product.images ?? []).isNotEmpty) {
+        image = product.images!.first.src ?? "";
+      }
+
+// 🧠 Metadata & Tags
+      final metaData = product.metaData ?? [];
+      final tags = product.tags ?? [];
+
+      if (kDebugMode) {
+        debugPrint("──────── PRODUCT DEBUG ────────");
+        debugPrint("ID        : $productId");
+        debugPrint("Name      : $productName");
+        debugPrint("SKU       : $productSku");
+        debugPrint("Price     : $productPrice");
+        debugPrint("Image     : $image");
+
+        // 🧠 META DATA
+        if (metaData.isNotEmpty) {
+          debugPrint("📦 META DATA:");
+          for (final m in metaData) {
+            debugPrint("  • ${m.key} = ${m.value}");
+          }
+        } else {
+          debugPrint("📦 META DATA: none");
+        }
+
+        // 🏷 TAGS
+        if (tags.isNotEmpty) {
+          debugPrint("🏷 TAGS:");
+          for (final tag in tags) {
+            debugPrint("  • ${tag.name ?? tag.slug ?? tag.id}");
+          }
+        } else {
+          debugPrint("🏷 TAGS: none");
+        }
+
+        debugPrint("──────────────────────────────");
+      }
+      // SKIP POPUP IF PRODUCT ALREADY EXISTS IN ORDERPANEL
+// ------------------------------------------------------------
+      final bool exists = await OrderHelper.existsInOrderBySku(
+        activeOrderId,
+        productSku,
+      );
+      // ------------------------------------------------------------
+// 🔥 FINAL BACKEND EXISTENCE CHECK
+// ------------------------------------------------------------
+      bool existsInBackend = false;
+
+      try {
+        final apiProducts = await ProductRepository()
+            .fetchProductBySku(normalizedBarcode, forceRefresh: true);
+
+        existsInBackend = apiProducts.isNotEmpty;
+
+        if (kDebugMode) {
+          print("🌐 Backend fresh validation → $existsInBackend");
+        }
+      } catch (e) {
+        print("⚠ Backend validation failed: $e");
+      }
+// 🚨 If backend says product does NOT exist
+      if (!existsInBackend && !isCustomItem) {
+        print("⛔ Backend confirms product deleted → cleaning ALL local cache");
+
+        // 🧠 MEMORY
+        OrderHelper.removeFromCache(normalizedBarcode);
+
+        // 💽 SKU CACHE
+        await StorageProvider.productCache.delete("sku_$normalizedBarcode");
+
+        // 🗑 REMOVE FROM FULL LIST CACHE (SAFE VERSION)
+        final allProducts =
+            await StorageProvider.productCache.get("all_products_list");
+
+        if (allProducts is List) {
+          final updated = allProducts.where((item) {
+            try {
+              // Case 1: Flat product map
+              if (item is Map && item["sku"] != null) {
+                final sku = item["sku"].toString().toLowerCase();
+                return sku != normalizedBarcode.toLowerCase();
+              }
+
+              // Case 2: Wrapped inside {products:[...]}
+              if (item is Map &&
+                  item["products"] is List &&
+                  item["products"].isNotEmpty) {
+                final first = item["products"][0];
+                final sku = (first["sku"] ?? "").toString().toLowerCase();
+                return sku != normalizedBarcode.toLowerCase();
+              }
+
+              return true;
+            } catch (_) {
+              return true;
+            }
+          }).toList();
+
+          await StorageProvider.productCache.put("all_products_list", updated);
+        }
+
+        print("🧹 Local cache fully cleaned for SKU: $normalizedBarcode");
+
+        _isLoading = false;
+        if (mounted) setState(() {});
+
+        await _openCustomItemDialog(context, trimmedBarcode);
+        return;
+      }
+
+      // ---------------------------------------------------------------------------
+// ⭐ FINAL EBT ELIGIBILITY CHECK (NOW PRODUCT IS LOADED) ✅
+// ---------------------------------------------------------------------------
+      bool isEbtEligible = false;
+
+      try {
+        final tags = product?.tags ?? [];
+
+        isEbtEligible = tags.any((t) {
+          final name = (t.name ?? "").toLowerCase();
+          final slug = (t.slug ?? "").toLowerCase();
+
+          return name == "ebt" ||
+              name == "ebt eligible" ||
+              slug == "ebt" ||
+              slug == "ebt-eligible";
+        });
+
+        print("💳 FINAL EBT Eligible? → $isEbtEligible (via product.tags)");
+      } catch (e) {
+        print("⚠ EBT eligibility error → $e");
+      }
+
+      // Detect variant intent early so barcode flow does not auto-increment
+      // and return before reaching the variants popup/API logic.
+      final bool hasVariantTag = (product.tags ?? []).any((t) {
+        final name = (t.name ?? "").toLowerCase();
+        final slug = (t.slug ?? "").toLowerCase();
+        return name.contains("variant") || slug.contains("variant");
+      });
+      final dynamic hasVariantsRaw = resolvedProductMap?["has_variants"];
+      final bool hasVariantMetaFlag = hasVariantsRaw == true ||
+          hasVariantsRaw?.toString().toLowerCase() == "true" ||
+          hasVariantsRaw?.toString() == "1";
+      final bool shouldOpenVariantFlow =
+          (product.variations ?? []).isNotEmpty ||
+              hasVariantTag ||
+              hasVariantMetaFlag;
+      final bool hasProduceTag = (product.tags ?? []).any((t) {
+        final name = (t.name ?? "").toString().toLowerCase().trim();
+        final slug = (t.slug ?? "").toString().toLowerCase().trim();
+        return name.contains("produce") || slug.contains("produce");
+      });
+
+      // 🔥 ONLY AUTO-INCREMENT NON-VARIANT PRODUCTS
+      if (exists &&
+          (product.variations ?? []).isEmpty &&
+          !shouldOpenVariantFlow &&
+          !hasProduceTag) {
+        print("🔁 NON-VARIANT → Auto increment");
+
+        await orderHelper.addItemToOrder(
+          productId,
+          productName,
+          image,
+          productPrice,
+          1,
+          productSku,
+          activeOrderId,
+          type: isCustomItem ? 'custom' : ItemType.product.value,
+          productId: productId,
+          isEbtEligible: isEbtEligible,
+          variationId: 0,
+          taxStatus: taxStatus,
+          taxClass: taxClass,
+          taxRate: taxRate,
+        );
+
+        await fetchOrderItems();
+        await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
+
+        _isLoading = false;
+        if (mounted) setState(() {});
+        return; // 🚫 STOP HERE — POPUP NEVER OPENS
+      }
+
+      // VARIABLE PRICE PRODUCT CHECK
+// ------------------------------------------------------------
+      final hasVariablePriceTag = (product.tags ?? []).any((tag) {
+        final name = (tag.name ?? "").toLowerCase();
+        final slug = (tag.slug ?? "").toLowerCase();
+        return name.contains("variable product") ||
+            slug.contains("variable-product");
+      });
+
+      print("🧪 hasVariablePriceTag = $hasVariablePriceTag");
+      print("⏳ _isLoading before popup = $_isLoading");
 
 // ------------------------------------------------------------
 // ⭐ SHOW VARIABLE PRICE POPUP (ONLY FIRST TIME)
 // ------------------------------------------------------------
-            if (hasVariablePriceTag) {
-              print("💡 Triggering ManualPriceDialog for variable product");
+      if (hasVariablePriceTag) {
+        print("💡 Triggering ManualPriceDialog for variable product");
 
-              try {
-                final double? enteredPrice = await ManualPriceDialog.show(
-                  context,
-                  productName: productName,
-                  productImage: image,
-                  minPrice: productPrice,
-                );
+        try {
+          final double? enteredPrice = await ManualPriceDialog.show(
+            context,
+            productName: productName,
+            productImage: image,
+            minPrice: productPrice,
+          );
 
-                print("💬 ManualPriceDialog returned → $enteredPrice");
+          print("💬 ManualPriceDialog returned → $enteredPrice");
 
-                if (enteredPrice == null) {
-                  print("❌ User cancelled ManualPriceDialog");
-                  return;
-                }
+          if (enteredPrice == null) {
+            print("❌ User cancelled ManualPriceDialog");
+            return;
+          }
 
-                print(
-                    "✅ Adding variable product to order with price $enteredPrice");
+          print("✅ Adding variable product to order with price $enteredPrice");
 
-                await orderHelper.addItemToOrder(
-                  productId,
-                  productName,
-                  image,
-                  enteredPrice,
-                  1,
-                  productSku,
-                  activeOrderId,
-                  type: isCustomItem ? 'custom' : ItemType.product.value,
-                  productId: productId,
-                  variationId: 0,
-                  isEbtEligible: isEbtEligible,
-                  taxStatus: taxStatus,
-                  taxClass: taxClass,
-                  taxRate: taxRate,
-                );
+          await orderHelper.addItemToOrder(
+            productId,
+            productName,
+            image,
+            enteredPrice,
+            1,
+            productSku,
+            activeOrderId,
+            type: isCustomItem ? 'custom' : ItemType.product.value,
+            productId: productId,
+            variationId: 0,
+            isEbtEligible: isEbtEligible,
+            taxStatus: taxStatus,
+            taxClass: taxClass,
+            taxRate: taxRate,
+          );
 
-                print("🛒 Product added to order");
+          print("🛒 Product added to order");
 
-                // / ⭐ FIX: MARK VARIABLE PRICE AS ALREADY ADDED
+          // / ⭐ FIX: MARK VARIABLE PRICE AS ALREADY ADDED
 // ------------------------------------------------------------
-                // ⭐ FIX: MARK VARIABLE PRICE AS ALREADY ADDED
-                final box = StorageProvider.offlineOrders;
-                final orderKey = activeOrderId.toString();
-                final hiveOrder = Map<String, dynamic>.from(
-                  await box.get(orderKey),
-                );
+          // ⭐ FIX: MARK VARIABLE PRICE AS ALREADY ADDED
+          final box = StorageProvider.offlineOrders;
+          final orderKey = activeOrderId.toString();
+          final hiveOrder = Map<String, dynamic>.from(
+            await box.get(orderKey),
+          );
 
 // Mark that popup has been shown once
-                hiveOrder["variable_price_added_$productId"] = true;
+          hiveOrder["variable_price_added_$productId"] = true;
 
 // VERY IMPORTANT: Store the actual manual price user entered
-                hiveOrder["selected_price_$productId"] = enteredPrice;
+          hiveOrder["selected_price_$productId"] = enteredPrice;
 
-                await box.put(orderKey, hiveOrder);
+          await box.put(orderKey, hiveOrder);
 
-                print(
-                    "💾 FIX APPLIED → Variable price flags saved for scanned product");
-                print("  → variable_price_added_$productId = true");
-                print("  → selected_price_$productId = $enteredPrice");
+          print(
+              "💾 FIX APPLIED → Variable price flags saved for scanned product");
+          print("  → variable_price_added_$productId = true");
+          print("  → selected_price_$productId = $enteredPrice");
 
-                await fetchOrderItems();
-                await CustomerDisplayHelper.updateCustomerDisplay(
-                    activeOrderId);
+          await fetchOrderItems();
+          await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
 
-                print("📊 Customer display updated");
-              } finally {
-                _isLoading = false;
-                if (mounted) setState(() {});
-                print("⏳ _isLoading after popup = $_isLoading");
-              }
+          print("📊 Customer display updated");
+        } finally {
+          _isLoading = false;
+          if (mounted) setState(() {});
+          print("⏳ _isLoading after popup = $_isLoading");
+        }
 
-              return; // STOP FURTHER EXECUTION
-            }
+        return; // STOP FURTHER EXECUTION
+      }
 
 // ------------------------------------------------------------
 // ⭐ NORMAL PRODUCT FLOW
 // ------------------------------------------------------------
-            print("➡ Not a variable product, continuing normal flow");
+      print("➡ Not a variable product, continuing normal flow");
 
-            // ======================================================
+      // ======================================================
 // ⭐ AGE RESTRICTION CHECK — FINAL STABLE VERSION
 // ======================================================
 
-            if (kDebugMode) {
-              print("\n---------------- AGE CHECK START ----------------");
-              print("Product Scanned: ID=${product.id}, Name=${product.name}");
-            }
+      if (kDebugMode) {
+        print("\n---------------- AGE CHECK START ----------------");
+        print("Product Scanned: ID=${product.id}, Name=${product.name}");
+      }
 
-            //PRODUCE (WEIGHED ITEMS) HANDLING
-            final bool hasProduceTag = (product?.tags ?? []).any((t) {
-              final name = (t.name ?? "").toString().toLowerCase().trim();
-              final slug = (t.slug ?? "").toString().toLowerCase().trim();
-              return name.contains("produce") || slug.contains("produce");
-            });
+      //PRODUCE (WEIGHED ITEMS) HANDLING
+      if (hasProduceTag) {
+        if (_isWeightDialogOpen) {
+          print("🚫 Weight dialog already open, ignoring duplicate scan");
+          return;
+        }
+        print(
+            "🏷 Produce tag detected on product → Showing AutoWeightPriceDialog");
 
-            if (hasProduceTag) {
-              print(
-                  "🏷 Produce tag detected on product → Showing AutoWeightPriceDialog");
+        // Stop loader before showing dialog
+        _isLoading = false;
+        if (mounted) setState(() {});
 
-              // Stop loader before showing dialog
-              _isLoading = false;
-              if (mounted) setState(() {});
+        _isWeightDialogOpen = true;
+        final result = await showDialog<Map<String, dynamic>>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => AutoWeightPriceDialog(
+            productName: productName,
+            unitPrice: productPrice,
+          ),
+        ).whenComplete(() {
+          _isWeightDialogOpen = false;
+        });
 
-              final result = await showDialog<Map<String, dynamic>>(
-                context: context,
-                barrierDismissible: false,
-                builder: (_) => AutoWeightPriceDialog(
-                  productName: productName,
-                  unitPrice: productPrice,
-                ),
-              );
+        if (result == null) {
+          print("Auto weight cancelled by user");
+          return;
+        }
 
-              if (result == null) {
-                print("Auto weight cancelled by user");
-                return;
-              }
+        final double finalPrice = result["finalPrice"] as double;
+        final double weight = result["weight"] as double;
 
-              final double finalPrice = result["finalPrice"] as double;
-              final double weight = result["weight"] as double;
+        print(
+            "Weight: ${weight}kg, Final Price: ₹${finalPrice.toStringAsFixed(2)}");
 
-              print(
-                  "Weight: ${weight}kg, Final Price: ₹${finalPrice.toStringAsFixed(2)}");
+        await orderHelper.addItemToOrder(
+          null, // or productId if you want to keep reference
+          productName,
+          image,
+          finalPrice,
+          1, // quantity = 1 (weight-based item)
+          productSku,
+          activeOrderId,
+          type: 'weighted',
+          weightQty: weight,
+          productId: productId,
+          variationId: -1,
+          salesPrice: finalPrice,
+          regularPrice: productPrice,
+          unitPrice: productPrice,
+          isEbtEligible: isEbtEligible,
+          // Optional: store weight in meta_data
+          // metaData: [
+          //   {"key": "weight",   "value": weight.toString()},
+          //   {"key": "unit",     "value": "kg"},
+          //   {"key": "_weighed", "value": "true"},
+          // ],
+          onItemAdded: () async {
+            print("Weighted produce item added successfully!");
+          },
+        );
 
-              await orderHelper.addItemToOrder(
-                null, // or productId if you want to keep reference
-                productName,
-                image,
-                finalPrice,
-                1, // quantity = 1 (weight-based item)
-                productSku,
-                activeOrderId,
-                type: 'weighted',
-                productId: productId,
-                variationId: -1,
-                salesPrice: finalPrice,
-                regularPrice: productPrice,
-                unitPrice: productPrice,
-                isEbtEligible: isEbtEligible,
-                // Optional: store weight in meta_data
-                // metaData: [
-                //   {"key": "weight",   "value": weight.toString()},
-                //   {"key": "unit",     "value": "kg"},
-                //   {"key": "_weighed", "value": "true"},
-                // ],
-                onItemAdded: () async {
-                  print("Weighted produce item added successfully!");
-                },
-              );
+        await fetchOrderItems();
+        await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
 
-              await fetchOrderItems();
-              await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
-
-              return; // critical: prevent normal quantity=1 addition below
-            }
+        return; // critical: prevent normal quantity=1 addition below
+      }
 //
 
 // ------------------------------------------------------
 // 1️⃣ INIT
 // ------------------------------------------------------
-            bool isRestricted = false;
-            int minimumAge = 0;
+      bool isRestricted = false;
+      int minimumAge = 0;
 
 // ------------------------------------------------------
 // 2️⃣ CHECK PRODUCT METADATA
 // ------------------------------------------------------
-            for (final meta in (product.metaData ?? [])) {
-              final key = (meta.key ?? "").toLowerCase().trim();
-              final rawValue =
-                  (meta.value ?? "").toString().toLowerCase().trim();
+      for (final meta in (product.metaData ?? [])) {
+        final key = (meta.key ?? "").toLowerCase().trim();
+        final rawValue = (meta.value ?? "").toString().toLowerCase().trim();
 
-              // Only process relevant keys
-              if (!(key.contains("age") || key.contains("age_restricted")))
-                continue;
+        // Only process relevant keys
+        if (!(key.contains("age") || key.contains("age_restricted"))) continue;
 
-              // Case 1: Boolean restriction (true / yes / 1)
-              if (rawValue == "true" || rawValue == "yes" || rawValue == "1") {
-                isRestricted = true;
-                continue;
-              }
+        // Case 1: Boolean restriction (true / yes / 1)
+        if (rawValue == "true" || rawValue == "yes" || rawValue == "1") {
+          isRestricted = true;
+          continue;
+        }
 
-              // Case 2: Extract numeric age (18, 21, etc.)
-              final match = RegExp(r'\d+').firstMatch(rawValue);
-              if (match != null) {
-                final parsedAge = int.tryParse(match.group(0)!);
-                if (parsedAge != null && parsedAge > minimumAge) {
-                  minimumAge = parsedAge;
-                  isRestricted = true;
-                }
-              }
-            }
+        // Case 2: Extract numeric age (18, 21, etc.)
+        final match = RegExp(r'\d+').firstMatch(rawValue);
+        if (match != null) {
+          final parsedAge = int.tryParse(match.group(0)!);
+          if (parsedAge != null && parsedAge > minimumAge) {
+            minimumAge = parsedAge;
+            isRestricted = true;
+          }
+        }
+      }
 
 // ------------------------------------------------------
 // 3️⃣ CHECK PRODUCT TAGS (Backup Validation)
 // ------------------------------------------------------
-            for (final tag in (product.tags ?? [])) {
-              final name = (tag.name ?? "").toLowerCase();
-              final slug = (tag.slug ?? "").toLowerCase();
+      for (final tag in (product.tags ?? [])) {
+        final name = (tag.name ?? "").toLowerCase();
+        final slug = (tag.slug ?? "").toLowerCase();
 
-              if (name.contains("alcohol") || slug.contains("alcohol")) {
-                isRestricted = true;
-              }
+        if (name.contains("alcohol") || slug.contains("alcohol")) {
+          isRestricted = true;
+        }
 
-              final hasAge = name.contains("18+") ||
-                  name.contains("21+") ||
-                  name.contains("age") ||
-                  slug.contains("18+") ||
-                  slug.contains("21+") ||
-                  slug.contains("age");
+        final hasAge = name.contains("18+") ||
+            name.contains("21+") ||
+            name.contains("age") ||
+            slug.contains("18+") ||
+            slug.contains("21+") ||
+            slug.contains("age");
 
-              if (hasAge) {
-                final match = RegExp(r'\d+').firstMatch(name + slug);
-                if (match != null) {
-                  final parsedAge = int.tryParse(match.group(0)!);
-                  if (parsedAge != null && parsedAge > minimumAge) {
-                    minimumAge = parsedAge;
-                    isRestricted = true;
-                  }
-                }
-              }
+        if (hasAge) {
+          final match = RegExp(r'\d+').firstMatch(name + slug);
+          if (match != null) {
+            final parsedAge = int.tryParse(match.group(0)!);
+            if (parsedAge != null && parsedAge > minimumAge) {
+              minimumAge = parsedAge;
+              isRestricted = true;
             }
+          }
+        }
+      }
 
 // ------------------------------------------------------
 // 4️⃣ LOAD ORDER DATA (Hive)
 // ------------------------------------------------------
-            final hiveBox = StorageProvider.offlineOrders;
-            final orderKey = orderHelper.activeOrderId.toString();
+      final hiveBox = StorageProvider.offlineOrders;
+      final orderKey = orderHelper.activeOrderId.toString();
 
-            // Ensure order exists
-            if (!await hiveBox.containsKey(orderKey)) {
-              await hiveBox.put(orderKey, {
-                "age_verified": false,
-              });
-            }
+      // Ensure order exists
+      if (!await hiveBox.containsKey(orderKey)) {
+        await hiveBox.put(orderKey, {
+          "age_verified": false,
+        });
+      }
 
-            final Map<String, dynamic> hiveOrder =
-                Map<String, dynamic>.from(await hiveBox.get(orderKey));
+      final Map<String, dynamic> hiveOrder =
+          Map<String, dynamic>.from(await hiveBox.get(orderKey));
 
 // ------------------------------------------------------
 // 5️⃣ CHECK IF ALREADY VERIFIED
 // ------------------------------------------------------
-            final bool alreadyVerified = hiveOrder["age_verified"] == true ||
-                hiveOrder["age_verified"] == 1 ||
-                hiveOrder["age_verified"]?.toString().toLowerCase() == "true";
+      final bool alreadyVerified = hiveOrder["age_verified"] == true ||
+          hiveOrder["age_verified"] == 1 ||
+          hiveOrder["age_verified"]?.toString().toLowerCase() == "true";
 
-            if (kDebugMode) {
-              print("Age restricted: $isRestricted");
-              print("Minimum age   : $minimumAge");
-              print("Already verified: $alreadyVerified");
-            }
+      if (kDebugMode) {
+        print("Age restricted: $isRestricted");
+        print("Minimum age   : $minimumAge");
+        print("Already verified: $alreadyVerified");
+      }
 
 // ------------------------------------------------------
 // 6️⃣ SHOW AGE VERIFICATION (ONCE)
 // ------------------------------------------------------
-            if (isRestricted && !alreadyVerified) {
-              // 🔴 STOP LOADING BEFORE OPENING AGE VERIFICATION
-              _isLoading = false;
-              if (mounted) setState(() {});
+      if (isRestricted && !alreadyVerified) {
+        // 🔴 STOP LOADING BEFORE OPENING AGE VERIFICATION
+        _isLoading = false;
+        if (mounted) setState(() {});
 
-              final verified = await AgeVerificationProvider()
-                  .ageRestrictedProduct(context, product);
+        final verified = await AgeVerificationProvider()
+            .ageRestrictedProduct(context, product);
 
-              // ❌ User cancelled or failed verification
-              if (!verified) {
-                return;
+        // ❌ User cancelled or failed verification
+        if (!verified) {
+          return;
+        }
+
+        // ✅ Mark as verified for this order
+        hiveOrder["age_verified"] = true;
+        await hiveBox.put(orderKey, hiveOrder);
+      }
+
+      if (kDebugMode) {
+        print("---------------- AGE CHECK END ----------------\n");
+      }
+
+      // ---------------------------------------------------------------------------
+      // 8️⃣ VARIATIONS FLOW
+      // =====================================================================
+      if (shouldOpenVariantFlow) {
+        List<Map<String, dynamic>> variants = [];
+
+        // 1️⃣ Try existing bloc stream flow first.
+        try {
+          productBloc.fetchProductVariations(product.id);
+          final response = await productBloc.variationStream
+              .firstWhere((r) => r.status == Status.COMPLETED)
+              .timeout(const Duration(milliseconds: 1200));
+
+          variants = (response.data ?? [])
+              .map((v) => {
+                    "id": v.id,
+                    "name": v.name,
+                    "price": v.price,
+                    "image": v.image?.src,
+                    "sku": v.sku,
+                  })
+              .toList();
+        } catch (_) {
+          // Fall through to direct API fetch below.
+        }
+
+        // 2️⃣ Fallback: direct Woo variation API by product id.
+        if (variants.isEmpty && product.id > 0) {
+          try {
+            final userData = await UserDbHelper().getUserData();
+            final String token = userData?[AppDBConst.userToken] ?? "";
+            final uri = Uri.parse(
+                '${UrlHelper.baseUrl}${UrlHelper.wooCommerceV3}products/${product.id}/variations');
+            final headers = <String, String>{
+              if (token.isNotEmpty) 'Authorization': 'Bearer $token',
+            };
+            final resp = await http.get(uri, headers: headers);
+            if (resp.statusCode == 200) {
+              final decoded = jsonDecode(resp.body);
+              if (decoded is List) {
+                variants = decoded
+                    .whereType<Map>()
+                    .map<Map<String, dynamic>>((v) {
+                      final map = v
+                          .map((key, value) => MapEntry(key.toString(), value));
+                      final attrs = map["attributes"];
+                      final String fallbackName = attrs is List
+                          ? attrs
+                              .whereType<Map>()
+                              .map((a) => (a["option"] ?? "").toString())
+                              .where((x) => x.isNotEmpty)
+                              .join(" - ")
+                          : "";
+                      return {
+                        "id": map["id"],
+                        "name": (map["name"] ?? "").toString().isNotEmpty
+                            ? map["name"]
+                            : (fallbackName.isNotEmpty
+                                ? fallbackName
+                                : "Variant"),
+                        "price": (map["price"] ?? map["regular_price"] ?? "0")
+                            .toString(),
+                        "image":
+                            (map["image"] is Map && map["image"]["src"] != null)
+                                ? map["image"]["src"]
+                                : (map["image"] is String ? map["image"] : ""),
+                        "sku": map["sku"] ?? "",
+                      };
+                    })
+                    .where((v) => v["id"] != null)
+                    .toList();
               }
-
-              // ✅ Mark as verified for this order
-              hiveOrder["age_verified"] = true;
-              await hiveBox.put(orderKey, hiveOrder);
             }
-
+          } catch (e) {
             if (kDebugMode) {
-              print("---------------- AGE CHECK END ----------------\n");
-            }
-
-            // ---------------------------------------------------------------------------
-            // 8️⃣ VARIATIONS FLOW
-            // =====================================================================
-            if ((product.variations ?? []).isNotEmpty) {
-              // 1️⃣ Fetch variants
-              productBloc.fetchProductVariations(product.id!);
-
-              final response = await productBloc.variationStream
-                  .firstWhere((r) => r.status == Status.COMPLETED);
-
-              if (response.data == null || response.data!.isEmpty) return;
-
-              final variants = response.data!
-                  .map((v) => {
-                        "id": v.id,
-                        "name": v.name,
-                        "price": v.price,
-                        "image": v.image?.src,
-                        "sku": v.sku,
-                      })
-                  .toList();
-
-              // 2️⃣ SHOW VARIANT POPUP (ALWAYS)
-              await showDialog(
-                context: context,
-                barrierDismissible: false,
-                builder: (_) => VariantsDialog(
-                  title: product?.name ?? "",
-                  variations: variants,
-                  onAddVariant: (selected, qty) async {
-                    await orderHelper.addItemToOrder(
-                      selected["id"],
-                      selected["name"],
-                      selected["image"],
-                      double.tryParse(selected["price"].toString()) ?? 0,
-                      qty,
-                      selected["sku"],
-                      activeOrderId,
-                      type: 'variant',
-                      productId: product?.id,
-                      variationId: selected["id"],
-                      isEbtEligible: isEbtEligible,
-                    );
-                    await fetchOrderItems();
-                    await CustomerDisplayHelper.updateCustomerDisplay(
-                        activeOrderId);
-
-                    Navigator.of(_).pop();
-                  },
-                ),
-              );
-
-              // 🔥 THIS LINE IS CRITICAL
-              // ⛔ STOP EVERYTHING ELSE
-              _isLoading = false;
-              if (mounted) setState(() {});
-              return;
-            }
-
-            // ---------------------------------------------------------------------------
-            // 9️⃣ ADD ITEM TO ORDER
-            // ---------------------------------------------------------------------------
-            await orderHelper.addItemToOrder(
-              productId,
-              productName,
-              image,
-              productPrice,
-              1,
-              productSku,
-              activeOrderId,
-              type: isCustomItem ? 'custom' : ItemType.product.value,
-              productId: productId,
-              variationId: 0,
-              isEbtEligible: isEbtEligible,
-              taxStatus: taxStatus,
-              taxClass: taxClass,
-              taxRate: taxRate,
-            );
-
-            await fetchOrderItems();
-            await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
-
-            _isLoading = false;
-            if (mounted) setState(() {});
-          } catch (e, s) {
-            print("❌ Scan failed: $e\n$s");
-          } finally {
-            // Only reset loading flags
-            if (_isLoading) {
-              _isLoading = false;
-              if (mounted) setState(() {});
+              print("⚠️ Variation fallback API failed: $e");
             }
           }
-        },
+        }
+
+        if (variants.isEmpty) {
+          _isLoading = false;
+          if (mounted) setState(() {});
+          return;
+        }
+
+        // 3️⃣ SHOW VARIANT POPUP (ALWAYS)
+        await showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => VariantsDialog(
+            title: product?.name ?? "",
+            variations: variants,
+            onAddVariant: (selected, qty) async {
+              await orderHelper.addItemToOrder(
+                selected["id"],
+                selected["name"],
+                selected["image"],
+                double.tryParse(selected["price"].toString()) ?? 0,
+                qty,
+                selected["sku"],
+                activeOrderId,
+                type: 'variant',
+                productId: product?.id,
+                variationId: selected["id"],
+                isEbtEligible: isEbtEligible,
+              );
+              await fetchOrderItems();
+              await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
+
+              Navigator.of(_).pop();
+            },
+          ),
+        );
+
+        // 🔥 THIS LINE IS CRITICAL
+        // ⛔ STOP EVERYTHING ELSE
+        _isLoading = false;
+        if (mounted) setState(() {});
+        return;
+      }
+
+      // ---------------------------------------------------------------------------
+      // 9️⃣ ADD ITEM TO ORDER
+      // ---------------------------------------------------------------------------
+      await orderHelper.addItemToOrder(
+        productId,
+        productName,
+        image,
+        productPrice,
+        1,
+        productSku,
+        activeOrderId,
+        type: isCustomItem ? 'custom' : ItemType.product.value,
+        productId: productId,
+        variationId: 0,
+        isEbtEligible: isEbtEligible,
+        taxStatus: taxStatus,
+        taxClass: taxClass,
+        taxRate: taxRate,
+      );
+
+      await fetchOrderItems();
+      await CustomerDisplayHelper.updateCustomerDisplay(activeOrderId);
+
+      _isLoading = false;
+      if (mounted) setState(() {});
+    } catch (e, s) {
+      print("❌ Scan failed: $e\n$s");
+    } finally {
+      _scanLocked = false;
+      // Only reset loading flags
+      if (_isLoading) {
+        _isLoading = false;
+        if (mounted) setState(() {});
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final themeHelper = Provider.of<ThemeNotifier>(context);
+    return FocusDetector(
+      onFocusLost: () {
+        // Build #1.0.219 -> FIXED ISSUE [SCRUM - 366] : Swipe-to-Delete UI State Not Resetting
+        // When this widget regains focus, reset slidable states
+        if (!mounted) return;
+        setState(() {
+          _listVersion++;
+        });
+      },
+      child: BarcodeKeyboardListener(
+        // Build #1.0.44 : Added - Wrap with BarcodeKeyboardListener for barcode scanning
+        // key:  _scannerKey,//Build #1.0.268: 3. Add key for scanner event
+        bufferDuration: const Duration(milliseconds: 700),
+        //Build #1.0.78: Removed orderHelper.addItemToOrder from the API success block, as it’s now in OrderBloc.updateOrderProducts.
+        // Kept local addItemToOrder for non-API orders.
+        // Ensured loader is shown during API calls and hidden afterward.
+        useKeyDownEvent: Platform.isWindows,
+        caseSensitive: true,
+        onBarcodeScanned: (barcode) =>
+            unawaited(_handleOrderPanelBarcode(barcode)),
 
         child: Stack(
           children: [
@@ -2004,11 +2324,12 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                   children: _tabController == null
                                       ? []
                                       : List.generate(tabs.length, (index) {
-                                          final int selectedIndex =
-                                              _tabController?.index ?? 0;
-                                          final isSelected = tabs[index]
-                                                  ["orderId"] ==
-                                              orderHelper.activeOrderId;
+                                          final tabOrderId = _normalizeOrderId(
+                                              tabs[index]["orderId"]);
+                                          final isSelected =
+                                              tabOrderId != null &&
+                                                  tabOrderId ==
+                                                      orderHelper.activeOrderId;
 
                                           return Padding(
                                             padding: const EdgeInsets.symmetric(
@@ -2046,8 +2367,9 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                 child: Row(
                                                   children: [
                                                     Text(
-                                                      tabs[index]["title"]
-                                                          as String,
+                                                      (tabs[index]["title"] ??
+                                                              "")
+                                                          .toString(),
                                                       style: TextStyle(
                                                         color: isSelected
                                                             ? const Color(
@@ -2312,6 +2634,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 //   }
 
   //Build #1.0.67: Handler methods for response and error
+
   Future<void> _handleResponse(
     APIResponse response,
     Map<String, dynamic> orderItem, {
@@ -2546,7 +2869,13 @@ class _RightOrderPanelState extends State<RightOrderPanel>
             orderHelper.activeOrderId = null;
             orderItems = [];
 
-            await _initializeTabController(); // ⭐ THIS TRIGGERS WELCOME
+            print("🧹 No tabs left → FINAL display reset");
+
+            // 🔥 FINAL authoritative reset
+            await CustomerDisplayService.resetDisplay();
+
+            await _initializeTabController();
+
             setState(() => _isLoading = false);
             return;
           }
@@ -2715,15 +3044,15 @@ class _RightOrderPanelState extends State<RightOrderPanel>
     // ============================
 
     // ============================
-// 🛑 CHECK: MERCHANT DISCOUNT & NEGATIVE TOTAL PREVENTION
+// 🛑 CHECK: MERCHANT DISCOUNT WHEN DELETING ITEMS
 // ============================
 
     final double merchantDiscount = (offlineOrder['merchantDiscount'] is num)
         ? (offlineOrder['merchantDiscount'] as num).toDouble()
         : 0.0;
 
-// If no discount → allow delete
-// 🔍 Detect type FIRST
+    // If no discount → allow delete
+    // 🔍 Detect type FIRST
     final String itemType = (orderItem['item_type'] ?? orderItem['type'] ?? '')
         .toString()
         .toLowerCase();
@@ -2731,7 +3060,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
     final bool isPayout = itemType == 'payout';
     final bool isCashback = itemType == 'cashback';
 
-// ✅ Skip validation for payout & cashback
+    // ✅ Skip merchant discount handling for payout & cashback
     if (merchantDiscount > 0 && !isPayout && !isCashback) {
       double productsTotal =
           ((offlineOrder['products'] as List?) ?? []).fold(0.0, (sum, p) {
@@ -2757,31 +3086,33 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         return sum + (price * qty);
       });
 
-      double currentTotal = productsTotal + customTotal;
+      final double currentTotal = productsTotal + customTotal;
 
-      double itemPrice = double.tryParse(orderItem['item_price']?.toString() ??
-              orderItem[AppDBConst.itemPrice]?.toString() ??
-              '0') ??
+      final double itemPrice = double.tryParse(
+              orderItem['item_price']?.toString() ??
+                  orderItem[AppDBConst.itemPrice]?.toString() ??
+                  '0') ??
           0;
 
-      int itemQty = int.tryParse(orderItem['items_count']?.toString() ??
+      final int itemQty = int.tryParse(orderItem['items_count']?.toString() ??
               orderItem[AppDBConst.itemCount]?.toString() ??
               '1') ??
           1;
 
-      double itemLineTotal = itemPrice * itemQty;
-      double newTotal = currentTotal - itemLineTotal;
+      final double itemLineTotal = itemPrice * itemQty;
+      final double newTotal = currentTotal - itemLineTotal;
 
       if (newTotal < merchantDiscount) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-              "Merchant discount exists. Deleting this item will make the order total negative. Please remove discount first.",
+              "Merchant discount is more than the new order total. Please remove merchant discount first before decreasing items.",
             ),
             backgroundColor: Colors.red,
             duration: Duration(seconds: 2),
           ),
         );
+        // Block decreasing / deleting this item until user removes discount.
         return;
       }
     }
@@ -3093,48 +3424,8 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         (s, p) => s + (double.tryParse(p['amount']?.toString() ?? '0') ?? 0));
     double cashbacksTotal = cashbacks.fold<double>(0,
         (s, c) => s + (double.tryParse(c['amount']?.toString() ?? '0') ?? 0));
-
     // final grossTotal = productTotal + payoutsTotal + cashbacksTotal;
-    // final orderDiscount = (offlineOrder['orderDiscount'] is num)
-    //     ? (offlineOrder['orderDiscount'] as num).toDouble()
-    //     : 0.0;
-    // final merchantDiscountVal = (offlineOrder['merchantDiscount'] is num)
-    //     ? (offlineOrder['merchantDiscount'] as num).toDouble()
-    //     : 0.0;
-    // final cashbackFee = (offlineOrder['cashbackFee'] is num)
-    //     ? (offlineOrder['cashbackFee'] as num).toDouble()
-    //     : 0.0;
-    // final orderTax = (offlineOrder['order_tax'] is num)
-    //     ? (offlineOrder['order_tax'] as num).toDouble()
-    //     : 0.0;
-    // offlineOrder['gross_total'] = grossTotal;
-    // offlineOrder['net_total'] =
-    //     grossTotal - orderDiscount - merchantDiscountVal;
-    // offlineOrder['net_payable'] =
-    //     offlineOrder['net_total'] + orderTax + cashbackFee;
-    //
-    // // 💾 Save updated order back to offline storage
-    // await offlineBox.put(orderKey, offlineOrder);
-    //
-    // await orderHelper.loadData();
-    //
-    // await CustomerDisplayHelper.updateCustomerDisplay(
-    //     orderHelper.activeOrderId!);
-    // final List productsForDisplay = products.map((p) {
-    //   return {
-    //     "name": p["name"] ?? p["product_name"] ?? "",
-    //     "quantity": p["quantity"] ?? p["items_count"] ?? 1,
-    //     "price": p["price"] ?? 0,
-    //   };
-    // }).toList();
-    // // Send update directly via CustomerService
-    // await CustomerService.publishCartUpdate(
-    //   orderHelper.activeOrderId!,
-    //   productsForDisplay,
-    //   subtotal: grossTotal,
-    //   tax: orderTax,
-    //   total: (offlineOrder['net_payable'] as num?)?.toDouble() ?? 0.0,
-    // );
+
     final double grossTotal = productTotal + payoutsTotal + cashbacksTotal;
     final double orderDiscount =
         (offlineOrder['orderDiscount'] as num?)?.toDouble() ?? 0.0;
@@ -3156,9 +3447,26 @@ class _RightOrderPanelState extends State<RightOrderPanel>
           double.tryParse(p['price']?.toString() ?? '0') ?? 0.0;
 
       if (!itemType.contains('custom')) {
+        const double defaultNonEbtTaxRate = 9.1;
         final int productId =
             int.tryParse((p['product_id'] ?? p['id'])?.toString() ?? '0') ?? 0;
-        orderTax += getProductTaxFromHive(productId, price, qty);
+        final bool isEbt = p['is_ebt_eligible'] == true;
+        final lineTaxStatus =
+            (p['tax_status'] ?? 'taxable').toString().toLowerCase();
+        final lineTaxRate =
+            double.tryParse((p['tax_rate'] ?? '0').toString()) ?? 0.0;
+        if (isEbt) {
+          orderTax += 0.0;
+        } else if (lineTaxStatus == 'taxable' && lineTaxRate > 0) {
+          orderTax += roundTaxHalfUp(((price * qty) * lineTaxRate) / 100);
+        } else {
+          double fallbackTax = getProductTaxFromHive(productId, price, qty);
+          if (fallbackTax <= 0 && lineTaxStatus != 'none') {
+            fallbackTax =
+                roundTaxHalfUp(((price * qty) * defaultNonEbtTaxRate) / 100);
+          }
+          orderTax += fallbackTax;
+        }
       } else {
         orderTax += getCustomItemTax(
           taxClass: p['tax_class'] ?? '',
@@ -3169,8 +3477,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         );
       }
     }
-    // you can also include customItems here if they carry tax
-
+    orderTax = roundTaxHalfUp(orderTax);
     offlineOrder['order_tax'] = orderTax;
 
     offlineOrder['gross_total'] = grossTotal;
@@ -3192,14 +3499,15 @@ class _RightOrderPanelState extends State<RightOrderPanel>
       };
     }).toList();
 
-    // // Send update directly via CustomerService
-    // await CustomerService.publishCartUpdate(
+    // Send update directly via CustomerService
+    // Do not block UI; display publishing can be slow.
+    // unawaited(CustomerService.publishCartUpdate(
     //   orderHelper.activeOrderId!,
     //   productsForDisplay,
     //   subtotal: grossTotal,
     //   tax: orderTax,
     //   total: (offlineOrder['net_payable'] as num?)?.toDouble() ?? 0.0,
-    // );
+    // ));
 
     OrderHelper.notifyOrderPanelToRefresh();
 
@@ -3282,7 +3590,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 
   double getCustomItemTax({
     required String taxClass,
-    required double unitPrice, // 👈 make this explicit
+    required double unitPrice, //  make this explicit
     required int qty,
     required List<Tax> taxes,
     double? taxRate,
@@ -3302,7 +3610,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
         );
 
         if (selected.slug.isEmpty) {
-          debugPrint("⚠ No tax class match → tax = 0.0");
+          debugPrint("⚠ No tax class mateh → tax = 0.0");
           return 0.0;
         }
 
@@ -3399,58 +3707,120 @@ class _RightOrderPanelState extends State<RightOrderPanel>
       final isar = IsarService.sync;
       if (isar == null) return 0.0;
 
-      final cachedEntries = isar.isarCacheEntrys
+      final allProductsEntry = isar.isarCacheEntrys
           .where()
-          .filter()
-          .keyStartsWith("products_")
-          .findAllSync();
+          .keyEqualTo("productCache::all_products_list")
+          .findFirstSync();
+      if (allProductsEntry == null) {
+        debugPrint("🧾 TAX DEBUG → all_products_list cache entry missing");
+        return 0.0;
+      }
 
-      for (final entry in cachedEntries) {
-        final List products = json.decode(entry.json);
+      final dynamic decoded = json.decode(allProductsEntry.json);
+      final List allProducts = decoded is List ? decoded : <dynamic>[];
+      final Map<int, dynamic> uniqueProducts = {};
 
-        final product = products.firstWhere(
-          (p) => p["fast_key_product_id"] == productId || p["id"] == productId,
-          orElse: () => null,
-        );
+      for (final raw in allProducts) {
+        try {
+          if (raw is! Map) continue;
+          final item = Map<String, dynamic>.from(raw);
+          final dynamic normalized = (item["products"] is List &&
+                  (item["products"] as List).isNotEmpty)
+              ? (item["products"] as List).first
+              : item;
+          if (normalized is! Map) continue;
+          final product = Map<String, dynamic>.from(normalized);
+          final int? pid = int.tryParse(
+              (product["fast_key_product_id"] ?? product["id"] ?? "")
+                  .toString());
+          if (pid == null) continue;
+          uniqueProducts[pid] = product;
+        } catch (_) {}
+      }
 
-        if (product == null) continue;
+      final product = uniqueProducts[productId];
+      if (product == null) {
+        unawaited(_agentDebugLog(
+          hypothesisId: "H1",
+          location: "widget_order_panel.dart:getProductTaxFromHive:notFound",
+          message: "product missing from all_products_list",
+          data: {
+            "productId": productId,
+            "allProductsCount": allProducts.length,
+            "uniqueProductsCount": uniqueProducts.length,
+          },
+        ));
+        debugPrint(
+            "🧾 TAX DEBUG → productId:$productId not found in all_products_list (raw:${allProducts.length}, unique:${uniqueProducts.length})");
+        return 0.0;
+      }
 
-        // ❌ No tax
-        if (product["tax_status"] == "none") {
-          return 0.0;
+      unawaited(_agentDebugLog(
+        hypothesisId: "H4",
+        location:
+            "widget_order_panel.dart:getProductTaxFromHive:allProductsLookup",
+        message: "product matched in all_products_list",
+        data: {
+          "productId": productId,
+          "allProductsCount": allProducts.length,
+          "uniqueProductsCount": uniqueProducts.length,
+          "taxStatus": product["tax_status"],
+          "hasFlatTaxRates": product["tax_rates"] is List,
+          "hasNestedTaxRates": product["tax"]?["tax_rates"] is List,
+          "scalarTaxRate": product["tax_rate"] ?? product["tax"]?["rate"],
+        },
+      ));
+      debugPrint(
+          "🧾 TAX DEBUG → product found in all_products_list (raw:${allProducts.length}, unique:${uniqueProducts.length})");
+
+      final taxStatus =
+          (product["tax_status"] ?? "taxable").toString().toLowerCase();
+      if (taxStatus == "none") {
+        debugPrint(
+            "🧾 TAX DEBUG → tax source:none (tax_status=none) in all_products_list");
+        return 0.0;
+      }
+
+      final bool hasFlatTaxRates = product["tax_rates"] is List &&
+          (product["tax_rates"] as List).isNotEmpty;
+      final bool hasNestedTaxRates = product["tax"]?["tax_rates"] is List &&
+          (product["tax"]?["tax_rates"] as List).isNotEmpty;
+      final taxRates = product["tax_rates"] ?? product["tax"]?["tax_rates"];
+      if (taxRates is List && taxRates.isNotEmpty) {
+        final source = hasFlatTaxRates
+            ? "all_products_list.tax_rates"
+            : (hasNestedTaxRates
+                ? "all_products_list.tax.tax_rates"
+                : "all_products_list.tax_rates(unknown-shape)");
+        debugPrint(
+            "🧾 TAX DEBUG → tax source:$source | rate_count:${taxRates.length}");
+        double taxTotal = 0.0;
+        for (final tax in taxRates) {
+          final double rate =
+              double.tryParse(tax["rate"]?.toString() ?? "0") ?? 0.0;
+          final double rawTax = (taxableBase * rate) / 100;
+          final double roundedTax = roundTaxHalfUp(rawTax);
+          taxTotal += roundedTax;
         }
+        final double finalTax = roundTaxHalfUp(taxTotal);
+        debugPrint("🧾 TAX DEBUG → final tax:$finalTax");
+        return finalTax;
+      }
 
-        final taxRates = product["tax"]?["tax_rates"];
-        if (taxRates is List && taxRates.isNotEmpty) {
-          double taxTotal = 0.0;
-
-          for (final tax in taxRates) {
-            final double rate =
-                double.tryParse(tax["rate"]?.toString() ?? "0") ?? 0.0;
-
-            // 🧮 Calculate tax for this rate
-            final double rawTax = (taxableBase * rate) / 100;
-
-            // ✅ ROUND EACH TAX PART (IMPORTANT)
-            final double roundedTax = (rawTax * 100).roundToDouble() / 100;
-
-            taxTotal += roundedTax;
-
-            debugPrint("🧾 Tax → rate:$rate raw:$rawTax rounded:$roundedTax");
-          }
-
-          // ✅ FINAL SAFETY ROUND
-          final double finalTax = (taxTotal * 100).roundToDouble() / 100;
-
-          debugPrint("✅ FINAL TAX → $finalTax");
-          return finalTax;
-        }
+      final fallbackRate = double.tryParse(
+            (product["tax_rate"] ?? product["tax"]?["rate"] ?? "0").toString(),
+          ) ??
+          0.0;
+      if (fallbackRate > 0) {
+        final fallbackTax = roundTaxHalfUp((taxableBase * fallbackRate) / 100);
+        debugPrint(
+            "🧾 TAX DEBUG → tax source:all_products_list.tax_rate rate:$fallbackRate tax:$fallbackTax");
+        return fallbackTax;
       }
     } catch (e, st) {
       debugPrint("❌ Tax error → $e");
       debugPrint(st.toString());
     }
-
     return 0.0;
   }
 
@@ -3733,9 +4103,9 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                         item['tax_Rate']?.toString() ??
                         '0') ??
                 0.0;
-
-            final double itemTax =
-                taxRate > 0 ? ((price * taxRate) / 100) * qty : 0.0;
+            final double itemTax = taxRate > 0
+                ? roundTaxHalfUp(((price * taxRate) / 100) * qty)
+                : 0.0;
 
             if (kDebugMode) {
               print("🧾 CUSTOM ITEM TAX → "
@@ -3797,6 +4167,17 @@ class _RightOrderPanelState extends State<RightOrderPanel>
           final qty = int.tryParse(item['quantity']?.toString() ?? '1') ?? 1;
           final price =
               double.tryParse(item['price']?.toString() ?? '0') ?? 0.0;
+          final bool isWeighted = itemType.contains('weighted');
+          String? displayQty;
+          if (isWeighted) {
+            final double unitPrice =
+                double.tryParse(item['unit_price']?.toString() ?? '') ?? 0.0;
+            final double w = (item['weight_qty'] as num?)?.toDouble() ??
+                (unitPrice > 0 ? (price / unitPrice) : 0.0);
+            // Trim trailing zeros: 1.500 -> 1.5, 1.000 -> 1
+            displayQty =
+                w.toStringAsFixed(3).replaceFirst(RegExp(r'\.?0+$'), '');
+          }
 
           double itemTax = 0.0;
           double itemDiscount = 0.0;
@@ -3805,8 +4186,23 @@ class _RightOrderPanelState extends State<RightOrderPanel>
               (item['product_id'] ?? item['id'])?.toString() ?? '';
 
           final int productId = int.tryParse(productIdStr) ?? 0;
+          final bool isEbt = item['is_ebt_eligible'] == true;
+          const double defaultNonEbtTaxRate = 9.1;
 
-          itemTax = getProductTaxFromHive(productId, price, qty);
+          final lineTaxStatus =
+              (item['tax_status'] ?? 'taxable').toString().toLowerCase();
+          final lineTaxRate =
+              double.tryParse((item['tax_rate'] ?? '0').toString()) ?? 0.0;
+          if (isEbt) {
+            itemTax = 0.0;
+          } else if (lineTaxStatus == 'taxable' && lineTaxRate > 0) {
+            itemTax = ((price * qty) * lineTaxRate) / 100;
+          } else {
+            itemTax = getProductTaxFromHive(productId, price, qty);
+            if (itemTax <= 0 && lineTaxStatus != 'none') {
+              itemTax = ((price * qty) * defaultNonEbtTaxRate) / 100;
+            }
+          }
           item['auto_discount_per_unit'] = qty > 0 ? itemDiscount / qty : 0.0;
           item['auto_discount_total'] = itemDiscount;
 
@@ -3831,6 +4227,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
             'auto_discount': itemDiscount,
             'original_total': price * qty,
             'product_id': productId,
+            if (displayQty != null) 'display_qty': displayQty,
           };
         }),
 
@@ -4232,6 +4629,31 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                       motion: const DrawerMotion(),
                                       children: [
                                         CustomSlidableAction(
+                                          // onPressed: (context) async {
+                                          //   if (kDebugMode) {
+                                          //     print(
+                                          //         "🗑️ Delete tapped for item: $orderItem");
+                                          //   }
+                                          //
+                                          //   final bool isOffline = orderHelper
+                                          //       .activeOrderId !=
+                                          //       null &&
+                                          //       (await StorageProvider
+                                          //           .offlineOrders
+                                          //           .containsKey(orderHelper
+                                          //           .activeOrderId
+                                          //           .toString()));
+                                          //
+                                          //   await deleteOfflineItem(orderItem,
+                                          //       itemIndex: index);
+                                          //
+                                          //   if (kDebugMode) {
+                                          //     print(isOffline
+                                          //         ? "✅ Offline item deleted immediately."
+                                          //         : "✅ Online item deleted immediately.");
+                                          //   }
+                                          // },
+
                                           onPressed: (context) async {
                                             if (kDebugMode) {
                                               print(
@@ -4247,8 +4669,87 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                         .activeOrderId
                                                         .toString()));
 
-                                            await deleteOfflineItem(orderItem,
-                                                itemIndex: index);
+                                            try {
+                                              int itemQty =
+                                                  orderItem["items_count"] ?? 0;
+                                              double itemTotal = (orderItem[
+                                                          "item_sum_price"] ??
+                                                      0)
+                                                  .toDouble();
+                                              int productId =
+                                                  orderItem["product_id"] ?? 0;
+
+                                              if (kDebugMode) {
+                                                print("📦 Qty: $itemQty");
+                                                print("💰 Total: $itemTotal");
+                                                print(
+                                                    "🆔 Product ID: $productId");
+                                              }
+
+                                              // Build: use dynamic base URL and user token/shift from UserDbHelper
+                                              final userData =
+                                                  await UserDbHelper()
+                                                      .getUserData();
+                                              final String token = userData?[
+                                                      AppDBConst.userToken] ??
+                                                  "";
+                                              final int? shiftId =
+                                                  await UserDbHelper()
+                                                      .getUserShiftId();
+
+                                              // final uri = Uri.parse(
+                                              //     'https://indigo.alekyatechsolutions.com/wp-json/pinaka-pos/v1/orders/track-void-items-event');
+
+                                              final uri = Uri.parse(
+                                                  '${UrlHelper.baseUrl}${UrlHelper.pinakaPosV1}orders/track-void-items-event${UrlHelper.apiKey}');
+
+                                              final headers = <String, String>{
+                                                'Content-Type':
+                                                    'application/json',
+                                                if (token.isNotEmpty)
+                                                  'Authorization':
+                                                      'Bearer $token',
+                                              };
+
+                                              var body = jsonEncode({
+                                                "offline_orderid":
+                                                    orderHelper.activeOrderId,
+                                                "shift_id": shiftId,
+                                                "item_id": productId,
+                                                "item_total": itemTotal,
+                                                "item_qty": itemQty,
+                                                "timestamp":
+                                                    DateTime.now().toString(),
+                                                "deleted_by":
+                                                    orderHelper.activeUserId
+                                              });
+
+                                              final response = await http.post(
+                                                  uri,
+                                                  headers: headers,
+                                                  body: body);
+
+                                              if (kDebugMode) {
+                                                print(
+                                                    "API Response Delete: ${response.statusCode}");
+                                                print("APIiii: ${uri}");
+                                                print("shiftId: ${shiftId}");
+                                                print(
+                                                    "orderid: ${orderHelper.activeOrderId}");
+
+                                                print(response.body);
+                                              }
+
+                                              // delete item locally
+                                              // orderHelper.orderItems.removeAt(index);
+
+                                              await deleteOfflineItem(orderItem,
+                                                  itemIndex: index);
+                                            } catch (e) {
+                                              if (kDebugMode) {
+                                                print("❌ Delete error: $e");
+                                              }
+                                            }
 
                                             if (kDebugMode) {
                                               print(isOffline
@@ -4256,6 +4757,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                   : "✅ Online item deleted immediately.");
                                             }
                                           },
+
                                           backgroundColor: Colors.transparent,
                                           child: Column(
                                             mainAxisAlignment:
@@ -4384,6 +4886,135 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                                     ?.toString() ??
                                                                 '0') ??
                                                             0.0;
+
+                                                    // Before applying the quantity change, enforce merchant discount rule:
+                                                    // If there is a merchant discount and reducing qty would make
+                                                    // merchantDiscount > (new gross - orderDiscount), then block
+                                                    // the change, show a snackbar, and remove the merchant discount.
+                                                    final currentProducts = List<
+                                                            Map<String,
+                                                                dynamic>>.from(
+                                                        products);
+                                                    double
+                                                        simulatedProductTotal =
+                                                        0.0;
+                                                    for (int i = 0;
+                                                        i <
+                                                            currentProducts
+                                                                .length;
+                                                        i++) {
+                                                      final p =
+                                                          currentProducts[i];
+                                                      final pPrice = double
+                                                              .tryParse(p['price']
+                                                                      ?.toString() ??
+                                                                  '0') ??
+                                                          0.0;
+                                                      final pQty = int.tryParse((i ==
+                                                                          index
+                                                                      ? newQuantity
+                                                                      : p['quantity'])
+                                                                  ?.toString() ??
+                                                              '1') ??
+                                                          1;
+                                                      simulatedProductTotal +=
+                                                          pPrice * pQty;
+                                                    }
+
+                                                    double
+                                                        simulatedCustomTotal =
+                                                        0.0;
+                                                    for (final c
+                                                        in customItems) {
+                                                      final cQty = int.tryParse(c[
+                                                                      'quantity']
+                                                                  ?.toString() ??
+                                                              '1') ??
+                                                          1;
+                                                      final cPrice = double.tryParse(c[
+                                                                      'custom_item_price']
+                                                                  ?.toString() ??
+                                                              c['amount']
+                                                                  ?.toString() ??
+                                                              c['price']
+                                                                  ?.toString() ??
+                                                              '0') ??
+                                                          0.0;
+                                                      simulatedCustomTotal +=
+                                                          cPrice * cQty;
+                                                    }
+
+                                                    final double simulatedGross = simulatedProductTotal +
+                                                        simulatedCustomTotal +
+                                                        (((offlineOrder['payouts']
+                                                                    as List?) ??
+                                                                [])
+                                                            .fold<double>(
+                                                                0,
+                                                                (s, p) =>
+                                                                    s +
+                                                                    (double.tryParse(p['amount']?.toString() ?? '0') ??
+                                                                        0.0))) +
+                                                        (((offlineOrder['cashbacks']
+                                                                    as List?) ??
+                                                                [])
+                                                            .fold<double>(
+                                                                0,
+                                                                (s, c) =>
+                                                                    s +
+                                                                    (double.tryParse(c['amount']?.toString() ?? '0') ??
+                                                                        0.0)));
+
+                                                    final double
+                                                        orderDiscountSim =
+                                                        (offlineOrder[
+                                                                    'orderDiscount']
+                                                                is num)
+                                                            ? (offlineOrder[
+                                                                        'orderDiscount']
+                                                                    as num)
+                                                                .toDouble()
+                                                            : 0.0;
+                                                    double merchantDiscountSim =
+                                                        (offlineOrder[
+                                                                    'merchantDiscount']
+                                                                is num)
+                                                            ? (offlineOrder[
+                                                                        'merchantDiscount']
+                                                                    as num)
+                                                                .toDouble()
+                                                            : 0.0;
+
+                                                    final double
+                                                        maxAllowedDiscountSim =
+                                                        (simulatedGross -
+                                                                orderDiscountSim)
+                                                            .clamp(
+                                                                0.0,
+                                                                double
+                                                                    .infinity);
+
+                                                    if (merchantDiscountSim >
+                                                        maxAllowedDiscountSim) {
+                                                      ScaffoldMessenger.of(
+                                                              context)
+                                                          .showSnackBar(
+                                                        const SnackBar(
+                                                          backgroundColor:
+                                                              Colors.red,
+                                                          content: Text(
+                                                            'Reduce quantity not allowed: please remove merchant discount first.',
+                                                            style: TextStyle(
+                                                                color: Colors
+                                                                    .white),
+                                                          ),
+                                                        ),
+                                                      );
+
+                                                      // Do not apply quantity change
+                                                      return;
+                                                    }
+
                                                     product['quantity'] =
                                                         newQuantity;
                                                     product['items_count'] =
@@ -4436,13 +5067,10 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                       customItems;
 
                                                   // Recalculate totals
-                                                  // Recalculate totals
                                                   double productTotal = 0.0;
                                                   for (final p in products) {
                                                     final qty = int.tryParse(p[
                                                                     'quantity']
-                                                                ?.toString() ??
-                                                            p['items_count']
                                                                 ?.toString() ??
                                                             '1') ??
                                                         1;
@@ -4457,22 +5085,17 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                     final qty = int.tryParse(c[
                                                                     'quantity']
                                                                 ?.toString() ??
-                                                            c['items_count']
-                                                                ?.toString() ??
                                                             '1') ??
                                                         1;
-                                                    final price = double.tryParse(c[
-                                                                    'custom_item_price']
-                                                                ?.toString() ??
-                                                            c['amount']
-                                                                ?.toString() ??
-                                                            c['price']
-                                                                ?.toString() ??
-                                                            '0') ??
+                                                    final price = double.tryParse(
+                                                            c['custom_item_price']
+                                                                    ?.toString() ??
+                                                                c['amount']
+                                                                    ?.toString() ??
+                                                                '0') ??
                                                         0.0;
                                                     productTotal += price * qty;
                                                   }
-
                                                   double payoutsTotal = ((offlineOrder[
                                                                   'payouts']
                                                               as List?) ??
@@ -4499,29 +5122,34 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                                               ?.toString() ??
                                                                           '0') ??
                                                                   0.0));
-
-                                                  final double grossTotal =
+                                                  final grossTotal =
                                                       productTotal +
                                                           payoutsTotal +
                                                           cashbacksTotal;
-                                                  final double orderDiscount =
-                                                      (offlineOrder['orderDiscount']
-                                                                  as num?)
-                                                              ?.toDouble() ??
-                                                          0.0;
-                                                  final double
-                                                      merchantDiscount =
-                                                      (offlineOrder['merchantDiscount']
-                                                                  as num?)
-                                                              ?.toDouble() ??
-                                                          0.0;
-                                                  final double cashbackFee =
-                                                      (offlineOrder['cashbackFee']
-                                                                  as num?)
-                                                              ?.toDouble() ??
-                                                          0.0;
-
-// 🔁 RECOMPUTE ORDER TAX FROM UPDATED ITEMS
+                                                  final orderDiscount = (offlineOrder[
+                                                              'orderDiscount']
+                                                          is num)
+                                                      ? (offlineOrder[
+                                                                  'orderDiscount']
+                                                              as num)
+                                                          .toDouble()
+                                                      : 0.0;
+                                                  final merchantDiscount =
+                                                      (offlineOrder[
+                                                                  'merchantDiscount']
+                                                              is num)
+                                                          ? (offlineOrder[
+                                                                      'merchantDiscount']
+                                                                  as num)
+                                                              .toDouble()
+                                                          : 0.0;
+                                                  final cashbackFee = (offlineOrder[
+                                                          'cashbackFee'] is num)
+                                                      ? (offlineOrder[
+                                                                  'cashbackFee']
+                                                              as num)
+                                                          .toDouble()
+                                                      : 0.0;
                                                   double orderTax = 0.0;
                                                   for (final p in products) {
                                                     final String itemType =
@@ -4622,7 +5250,6 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                   //   tax: orderTax,
                                                   //   total: (offlineOrder['net_payable'] as num?)?.toDouble() ?? 0.0,
                                                   // );
-
                                                   // 🔁 Refresh UI instantly
                                                   if (mounted) {
                                                     setState(() {
@@ -5027,21 +5654,117 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                     children: [
                                                       // PRICE × QTY
                                                       if (!isCouponOrPayout)
-                                                        Text(
-                                                          "${TextConstants.currencySymbol}${(orderItem['item_price'] ?? orderItem['price'] ?? 0).toStringAsFixed(2)} × ${(orderItem['items_count'] ?? orderItem['quantity'] ?? 1)}",
-                                                          style: TextStyle(
-                                                            color: themeHelper
-                                                                        .themeMode ==
-                                                                    ThemeMode
-                                                                        .dark
-                                                                ? ThemeNotifier
-                                                                    .textDark
-                                                                : Colors
-                                                                    .black54,
-                                                            fontSize: 12,
-                                                            fontWeight:
-                                                                FontWeight.bold,
-                                                          ),
+                                                        Builder(
+                                                          builder: (_) {
+                                                            final String
+                                                                itemTypeStr =
+                                                                (orderItem['item_type'] ??
+                                                                        '')
+                                                                    .toString()
+                                                                    .toLowerCase();
+                                                            final bool
+                                                                isWeightedRow =
+                                                                itemTypeStr
+                                                                    .contains(
+                                                                        'weighted');
+
+                                                            // For weighing items: derive unit price from line total ÷ weight
+                                                            if (isWeightedRow) {
+                                                              final dynamic
+                                                                  rawQty =
+                                                                  orderItem[
+                                                                          'display_qty'] ??
+                                                                      orderItem[
+                                                                          'weight_qty'] ??
+                                                                      orderItem[
+                                                                          'quantity'] ??
+                                                                      1;
+                                                              final double qty = (rawQty
+                                                                      is num)
+                                                                  ? rawQty
+                                                                      .toDouble()
+                                                                  : double.tryParse(
+                                                                          rawQty
+                                                                              .toString()) ??
+                                                                      1.0;
+
+                                                              final double lineTotal = ((orderItem['original_total'] ??
+                                                                      orderItem[
+                                                                          'item_price'] ??
+                                                                      orderItem[
+                                                                          'price'] ??
+                                                                      0) as num)
+                                                                  .toDouble();
+
+                                                              final double
+                                                                  unitPrice =
+                                                                  qty > 0
+                                                                      ? lineTotal /
+                                                                          qty
+                                                                      : lineTotal;
+
+                                                              final String
+                                                                  qtyStr =
+                                                                  qty.toString();
+
+                                                              return Text(
+                                                                "${TextConstants.currencySymbol}${unitPrice.toStringAsFixed(2)} × $qtyStr",
+                                                                style:
+                                                                    TextStyle(
+                                                                  color: themeHelper
+                                                                              .themeMode ==
+                                                                          ThemeMode
+                                                                              .dark
+                                                                      ? ThemeNotifier
+                                                                          .textDark
+                                                                      : Colors
+                                                                          .black54,
+                                                                  fontSize: 12,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold,
+                                                                ),
+                                                              );
+                                                            }
+
+                                                            // Non‑weighing items: keep existing behaviour (item_price × qty)
+                                                            final double price =
+                                                                ((orderItem['item_price'] ??
+                                                                        orderItem[
+                                                                            'price'] ??
+                                                                        0) as num)
+                                                                    .toDouble();
+                                                            final dynamic
+                                                                rawQty =
+                                                                orderItem[
+                                                                        'display_qty'] ??
+                                                                    orderItem[
+                                                                        'items_count'] ??
+                                                                    orderItem[
+                                                                        'quantity'] ??
+                                                                    1;
+                                                            final String
+                                                                qtyStr = rawQty
+                                                                    .toString();
+
+                                                            return Text(
+                                                              "${TextConstants.currencySymbol}${price.toStringAsFixed(2)} × $qtyStr",
+                                                              style: TextStyle(
+                                                                color: themeHelper
+                                                                            .themeMode ==
+                                                                        ThemeMode
+                                                                            .dark
+                                                                    ? ThemeNotifier
+                                                                        .textDark
+                                                                    : Colors
+                                                                        .black54,
+                                                                fontSize: 12,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                              ),
+                                                            );
+                                                          },
                                                         ),
 
                                                       // Space only when price exists AND (EBT or Variant to show)
@@ -5278,8 +6001,47 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                 ? ThemeNotifier.textDark
                                                 : ThemeNotifier.textLight),
                                       ),
-                                      Text(
-                                          "${TextConstants.currencySymbol}${grossTotal.toStringAsFixed(2)}", //Build #1.0.68
+                                      Text((() {
+                                        final bool hasOnlyPayoutItems =
+                                            orderItems.isNotEmpty &&
+                                                orderItems.every((item) {
+                                                  final name = (item[AppDBConst
+                                                              .itemName] ??
+                                                          item['item_name'] ??
+                                                          '')
+                                                      .toString()
+                                                      .toLowerCase();
+                                                  final type = (item[AppDBConst
+                                                              .itemType] ??
+                                                          item['item_type'] ??
+                                                          '')
+                                                      .toString()
+                                                      .toLowerCase();
+                                                  final isRefunded = item[
+                                                              AppDBConst
+                                                                  .isRefundItem] ==
+                                                          1 ||
+                                                      item[AppDBConst
+                                                              .isRefundItem] ==
+                                                          true;
+                                                  if (isRefunded) return true;
+                                                  return name.contains(
+                                                          TextConstants
+                                                              .payoutText) ||
+                                                      type.contains(
+                                                          TextConstants
+                                                              .payoutText);
+                                                });
+                                        final double grossTotalValue =
+                                            (grossTotal as num).toDouble();
+                                        final double displayGrossTotal =
+                                            hasOnlyPayoutItems
+                                                ? -grossTotalValue.abs()
+                                                : grossTotalValue;
+                                        return displayGrossTotal < 0
+                                            ? "-${TextConstants.currencySymbol}${displayGrossTotal.abs().toStringAsFixed(2)}"
+                                            : "${TextConstants.currencySymbol}${displayGrossTotal.toStringAsFixed(2)}";
+                                      })(), // Build #1.0.68
                                           style: TextStyle(
                                               fontWeight: FontWeight.bold,
                                               fontSize: 15,
@@ -5409,6 +6171,10 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                                                   String,
                                                                   dynamic>.from(
                                                               rawOrder);
+
+                                                          // Build #1.0.287: Ensure ID is preserved in map content
+                                                          order['order_id'] =
+                                                              activeOrderId;
 
                                                           // ────────────────────────────────────────────────
                                                           // Remove ALL possible merchant discount fields
@@ -5857,8 +6623,21 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                 }
 
                                 setState(() => _isPayBtnLoading = true);
+                                // 🔥 ADD THIS LINE
+                                // await Future.delayed(Duration(milliseconds: 100));
 
                                 try {
+                                  final int? frozenCheckoutOrderId =
+                                      orderHelper.activeOrderId;
+                                  if (frozenCheckoutOrderId == null) {
+                                    if (mounted) {
+                                      setState(() => _isPayBtnLoading = false);
+                                    }
+                                    _showError(
+                                        'Unable to open payment: no active order.');
+                                    return;
+                                  }
+
                                   final List<Map<String, dynamic>>
                                       workingItems = orderItems
                                           .map((e) =>
@@ -5872,7 +6651,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                   // =======================================================
                                   final box = StorageProvider.offlineOrders;
                                   final hiveKey =
-                                      orderHelper.activeOrderId.toString();
+                                      frozenCheckoutOrderId.toString();
 
                                   double totalEbtAfterDiscount = 0.0;
 
@@ -5975,8 +6754,38 @@ class _RightOrderPanelState extends State<RightOrderPanel>
 
                                     double itemTax = 0.0;
                                     if (productId > 0) {
-                                      itemTax = getProductTaxFromHive(
-                                          productId, discountedUnitPrice, qty);
+                                      final bool isEbt =
+                                          item['is_ebt_eligible'] == true;
+                                      const double defaultNonEbtTaxRate = 9.1;
+                                      final lineTaxStatus =
+                                          (item['tax_status'] ?? 'taxable')
+                                              .toString()
+                                              .toLowerCase();
+                                      final lineTaxRate = double.tryParse(
+                                              (item['tax_rate'] ?? '0')
+                                                  .toString()) ??
+                                          0.0;
+                                      if (isEbt) {
+                                        itemTax = 0.0;
+                                      } else if (lineTaxStatus == 'taxable' &&
+                                          lineTaxRate > 0) {
+                                        itemTax = roundTaxHalfUp(
+                                            ((discountedUnitPrice * qty) *
+                                                    lineTaxRate) /
+                                                100);
+                                      } else {
+                                        itemTax = getProductTaxFromHive(
+                                            productId,
+                                            discountedUnitPrice,
+                                            qty);
+                                        if (itemTax <= 0 &&
+                                            lineTaxStatus != 'none') {
+                                          itemTax = roundTaxHalfUp(
+                                              ((discountedUnitPrice * qty) *
+                                                      defaultNonEbtTaxRate) /
+                                                  100);
+                                        }
+                                      }
                                     } else if (item['item_type'] == 'custom') {
                                       itemTax = getCustomItemTax(
                                         taxClass: item['tax_class'] ?? '',
@@ -5990,7 +6799,8 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                     totalTaxAfterDiscount += itemTax;
                                     item['tax_after_discount'] = itemTax;
                                   }
-
+                                  totalTaxAfterDiscount =
+                                      roundTaxHalfUp(totalTaxAfterDiscount);
                                   for (final item in workingItems) {
                                     final double price =
                                         (item['item_price'] as num?)
@@ -6043,22 +6853,21 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                   // 🔹 SAVE TO HIVE
                                   // =======================================================
                                   final localKey =
-                                      orderHelper.activeOrderId.toString();
+                                      frozenCheckoutOrderId.toString();
                                   final existingLocal = await box.get(localKey);
                                   final Map<String, dynamic> updated =
                                       existingLocal != null
                                           ? Map<String, dynamic>.from(
                                               existingLocal)
                                           : <String, dynamic>{
-                                              'order_id':
-                                                  orderHelper.activeOrderId,
-                                              'id': orderHelper.activeOrderId,
+                                              'order_id': frozenCheckoutOrderId,
+                                              'id': frozenCheckoutOrderId,
                                               'products':
                                                   <Map<String, dynamic>>[],
                                             };
 
-                                  updated["tax_discount"] = double.parse(
-                                      totalTaxAfterDiscount.toStringAsFixed(2));
+                                  updated["tax_discount"] =
+                                      totalTaxAfterDiscount;
 
                                   updated["cashback_fee"] = double.parse(
                                       cashbackFee.toStringAsFixed(2));
@@ -6125,7 +6934,7 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                   debugPrint(jsonEncode(verify));
                                   await CustomerDisplayHelper
                                       .updateCustomerDisplay(
-                                          orderHelper.activeOrderId!,
+                                          frozenCheckoutOrderId,
                                           summaryEnabled: true);
 
                                   // =======================================================
@@ -6133,8 +6942,10 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                   // =======================================================
                                   final result = await Navigator.push(
                                     context,
-                                    MaterialPageRoute(
-                                      builder: (_) => OrderSummaryScreen(
+                                    PageRouteBuilder(
+                                      pageBuilder: (context, animation,
+                                              secondaryAnimation) =>
+                                          OrderSummaryScreen(
                                         formattedDate: displayDate,
                                         formattedTime: displayTime,
                                         orderItems: summaryItems,
@@ -6145,14 +6956,34 @@ class _RightOrderPanelState extends State<RightOrderPanel>
                                         netPayable: (grossAfterDiscount +
                                             totalTaxAfterDiscount),
                                         orderId: serverOrderId ??
-                                            orderHelper.activeOrderId,
+                                            frozenCheckoutOrderId,
                                         isOfflineSynced: serverOrderId != null,
-                                        offlineOrderId:
-                                            orderHelper.activeOrderId,
+                                        offlineOrderId: frozenCheckoutOrderId,
                                         cashbackFee: cashbackFee,
                                         ebtAmount: totalEbtAfterDiscount,
                                         discountAmount: discountAmount,
                                       ),
+                                      transitionDuration:
+                                          const Duration(milliseconds: 220),
+                                      transitionsBuilder: (context, animation,
+                                          secondaryAnimation, child) {
+                                        final curved = CurvedAnimation(
+                                          parent: animation,
+                                          curve: Curves.easeOutCubic,
+                                        );
+
+                                        return FadeTransition(
+                                          opacity: curved,
+                                          child: SlideTransition(
+                                            position: Tween<Offset>(
+                                              begin: const Offset(0.05,
+                                                  0), // slight right → natural feel
+                                              end: Offset.zero,
+                                            ).animate(curved),
+                                            child: child,
+                                          ),
+                                        );
+                                      },
                                     ),
                                   );
                                 } catch (e, s) {
